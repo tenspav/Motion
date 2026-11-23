@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+*.png
+*.csv
+.DS_Store
