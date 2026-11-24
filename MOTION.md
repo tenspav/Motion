@@ -2,7 +2,7 @@
 
 Motion is a real-time frame-generation engine for Apple silicon. It turns a 30 FPS game stream into 60 FPS by building one new frame between every two real frames. It is an alternative to Apple's built-in interpolator (`VTLowLatencyFrameInterpolation`), and it is currently in **beta**. It was built for low-latency PS5 Remote Play streaming and runs in the FramePortal app.
 
-**Current version: Motion v0.5-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
+**Current version: Motion v0.7-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
 
 Engineering log and benchmark history: [MOTION_PROGRESS.md](MOTION_PROGRESS.md).
 
@@ -188,12 +188,18 @@ These are environment variables for A/B benchmarks. The defaults are what ships.
 | `MFG_SUBPIX` | 1 | Bit 16: parabolic sub-pixel fit (`MFG_SUBC` 0.04: winners under this cost only). |
 | `MFG_HOLE` | 1 | Bit 64: 1-ring pull for midpoint cells over `MFG_HOLEC` (0.08). |
 | `MFG_P3` | 7 | Pass 3 changes as a bit mask (on by default since v0.6: about +2.4 ms p50 / +2.7 ms p95 over the Pass 2 picture). The per-feature switches below override single bits. |
-| `MFG_SOFT` | 1 | Bit 1: soft upsample. `MFG_SOFTS` 0.12 (cost scale), `MFG_SOFTM` 2 / `MFG_SOFTMR` 0.3 (merge radius: px / share of the vector length), `MFG_SOFTTOP` 3 (entries warped, 2 or 3), `MFG_SOFTKMIN` 0 (weight under which an entry is dropped), `MFG_SOFTH` 0.004 (unchanged-pixel rule). `MFG_SOFTV2=0` runs the v0.5 loop (`MFG_SOFTK` 1: 3×3 tent, 0 = 2×2 bilinear), about 2 ms slower. |
+| `MFG_SOFT` | 1 | Bit 1: soft upsample. `MFG_SOFTS` 0.06 (cost scale; 0.12 measured in v0.7: +0.03 dB GTA, −0.3 dB synthetic object), `MFG_SOFTM` 2 / `MFG_SOFTMR` 0.3 (merge radius: px / share of the vector length), `MFG_SOFTTOP` 3 (entries warped, 2 or 3), `MFG_SOFTKMIN` 0 (weight under which an entry is dropped), `MFG_SOFTH` 0.004 (unchanged-pixel rule). `MFG_SOFTV2=0` runs the v0.5 loop (`MFG_SOFTK` 1: 3×3 tent, 0 = 2×2 bilinear), about 2 ms slower. |
 | `MFG_GLYPH` | 1 | Bit 2: pair-local subtitle guard (v0.6; replaces v0.5's `MFG_LOCK`). `MFG_GBAND` 0.70,0.98 (rows, share of the height), `MFG_GSTROKE` 0.035, `MFG_GBRIGHT` 0.45, `MFG_GCENTER` 0.012, `MFG_GSHAPE` 0.025, `MFG_GWORLD` 0.02, `MFG_GMOVE` 2, `MFG_GBINS` 3, `MFG_GONSET` 1, `MFG_GGROW` 1, `MFG_GFINE` 0 (anti-copy per luma px). |
 | `MFG_EDGE` | 1 | Bit 4: frame-edge fade and distance weighting. |
 | `MFG_SHADOW` | 0 | Bit 8: shadow-over-road zero-mean retry (v0.6; replaces v0.5's `MFG_CMATCH`). `MFG_SHCORR` 0.75, `MFG_SHEZ` 0.012, `MFG_SHMARGIN` 0.004, `MFG_SHMD` 0.015, `MFG_SHTEX` 0.012, `MFG_SHFB` 1. Neutral on the benches. |
 | `MFG_HUDPX` | 0 | Bit 32: static-HUD cells offer their moving vector per pixel. |
 | `MFG_P3DBG` | 0 | Debug views of Pass 3 (1 = glyph mask, 2 = soft-path pixels, 4 = anti-copy rejections). |
+| `MFG_PROOF` | 1 | v0.7: a proven one-sided cell keeps its own vector's cost, and the 1-ring pull never hands it an unproven vector (removed the 8-px square next to the first subtitle letter). |
+| `MFG_CUT` | 1 | v0.7: hard scene cut → every made frame of the pair is a clean copy of A. `MFG_CUTS` 0.45 (guide texture change), `MFG_CUTH` 0.45 (histogram distance), `MFG_CUTP` 0.05 (share of cells costing over 0.04). `MFG_CUTLOG=1` prints the evidence per pair. |
+| `MFG_REJECT` | | v0.7: a pair over `rejectFraction` (30 % bad cells) is a clean repeat of A; `skip` = the v0.6 skip (completion nil). |
+| `MFG_Q10` | 1 | v0.7: 10-bit made frames written as canonical x420 codes (low 6 bits zero). |
+| `MFG_GFOOT` | 0 | v0.7: subtitle anti-copy tests all four bilinear taps. Off: no visible change, −0.02 dB on 20-55-31. |
+| `MFG_SELX` | 0 | v0.7: exact early exit in the selection window. Off: bit-identical but 0.1 ms slower on an M2. |
 | `MFG_TG` | | Threadgroup shape per kernel for sweeps, e.g. `mfg_anchor=8x8,mfg_upwarp=32x4`. |
 | `MFG_VERBOSE` | 0 | 1 = print shader compile errors. |
 | `FG_DEBUG_VIEW` | 0 | 1 = occlusion map, 2 = horizontal vector, written into the luma plane. |

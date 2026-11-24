@@ -4,20 +4,22 @@ Motion is a real-time frame-generation engine for Apple silicon. It turns a 30 F
 
 It runs on the GPU (Metal) and the video hardware's motion estimator (VideoToolbox). It works on the decoded YCbCr frames as they are, 8-bit or 10-bit HDR, with no RGB conversion and no Neural Engine. It is one Swift file with no dependencies outside Apple's frameworks.
 
-**Current version: v0.6-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app.
+**Current version: v0.7-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app.
 
 ## How it compares
 
 Apple ships its own interpolator, `VTLowLatencyFrameInterpolation`. On a 1080p30 HDR gameplay recording (GTA VI), MacBook Air M2:
 
-| | Motion v0.6-beta | Apple |
+| | Motion v0.7-beta | Apple |
 |---|---|---|
-| Time to make one frame (median / 95th percentile) | **13.3 / 15.4 ms** | 14.8 / 16.7 ms |
-| Overall picture quality (Y-PSNR) | **29.39 dB** | 28.17 dB |
-| Thin edges: poles, signs, outlines (edge PSNR) | **26.68 dB** | 26.61 dB |
+| Time to make one frame (median / 95th percentile) | **13.3 / 15.4 ms**\* | 14.8 / 16.7 ms |
+| Overall picture quality (Y-PSNR) | **29.40 dB** | 28.17 dB |
+| Thin edges: poles, signs, outlines (edge PSNR) | **26.69 dB** | 26.61 dB |
 | Steadiness, frame to frame (higher = less shimmer) | **25.81 dB** | 24.72 dB |
 
 The test is harsh on purpose: frames 1 and 3 are used to rebuild frame 2, twice the motion of a live 30 → 60 step. A plain 50/50 blend scores 26.17 / 24.13 dB.
+
+\* Measured on v0.6; v0.7's cost is the same within run-to-run noise on a shared M2.
 
 Live, at 60 FPS in a game stream, Motion's lower cost means far fewer frames miss the display's 16.7 ms deadline:
 
@@ -29,9 +31,15 @@ Live, at 60 FPS in a game stream, Motion's lower cost means far fewer frames mis
 These live numbers are from an earlier Motion version (v0.1-beta).
 
 **What it does well:** camera pans, HUD text and icons that stay still, screen edges, thin power lines and car outlines.
+**New in v0.7:**
+- `trySubmit(prev:cur:completion:)` never waits: it answers `.busy` at once while the previous pair still holds the engine, so a live app shows the real frame instead of stalling.
+- A hard scene cut gives a clean copy of the older frame instead of a ghost blend of two scenes (`lastOutcome` tells `.made`, `.cut` or `.rejected`).
+- A cell proven from one side keeps the cost of the vector it really uses, which removes a small dark square next to the first letter of moving subtitles.
+- 10-bit output is written as canonical `x420` codes.
+
 **New in v0.6:** the soft upsample, frame-edge fade and a pair-local subtitle guard are on by default and cheaper than v0.5's optional cleanup. Fast shadows no longer break into blocks and moving subtitles stay whole. Set `MFG_P3=0` for the faster v0.5 output (about 2.4 ms less per frame).
 
-**Experimental 120 FPS:** on a 120 Hz display, `interpolate4(prev:cur:)` makes three frames per real pair (t = 0.25, 0.5, 0.75), about 21 ms per pair at 1080p on an M2. The 60 FPS output is unchanged.
+**Experimental 120 FPS:** on a 120 Hz display, `interpolate4(prev:cur:)` (or `trySubmit4`, with `fourX: true` at init) makes three frames per real pair (t = 0.25, 0.5, 0.75), about 21 ms per pair at 1080p on an M2. The 60 FPS output is unchanged.
 
 **Still in progress:**
 - see-through layers over fast motion (a car's shadow on a moving road, a translucent minimap);
@@ -63,16 +71,19 @@ guard let motion = MotionInterpolator(width: 1920, height: 1080) else { return }
 try motion.start()
 
 // For each new decoded frame `cur`, with the previous one in `prev`:
-motion.interpolate(prev: prev, cur: cur) { made, error in
+let admission = motion.trySubmit(prev: prev, cur: cur) { made, error in
     // made: the frame halfway between prev and cur, in the same pixel format.
-    // nil with no error: the pair was unreliable (a scene cut, for example). Show the real frame only.
-    // Show `made` 16.7 ms before `cur`.
+    // At a hard scene cut it is a clean copy of prev (see motion.lastOutcome).
+    // Show it halfway between the two real frames' times.
+}
+if admission == .busy {
+    // The previous pair is still running: show the real frame only and try again with the next one.
 }
 
 motion.end()
 ```
 
-The completion runs on a Metal callback queue. Keep `prev` and `cur` alive until it fires.
+`interpolate(prev:cur:completion:)` does the same but reports busy as an error. The completion runs on a Metal callback queue. Keep `prev` and `cur` alive until it fires.
 
 ## Benchmark it yourself
 

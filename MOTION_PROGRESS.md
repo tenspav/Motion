@@ -6,7 +6,8 @@ Motion has its own version number, separate from the FramePortal app it ships in
 
 | Motion | Shipped in FramePortal | Summary |
 |---|---|---|
-| **v0.6-beta** | v1.14.0 | Pass 3 on by default and 1.3 ms (p95 3.1 ms) cheaper than v0.5's; pair-local subtitle guard replaces the overlay lock |
+| **v0.7-beta** | v2.1.0 | Non-blocking admission, clean repeat at hard cuts, true midpoint times, side proof fixes the subtitle square |
+| v0.6-beta | v1.14.0 | Pass 3 on by default and 1.3 ms (p95 3.1 ms) cheaper than v0.5's; pair-local subtitle guard replaces the overlay lock |
 | v0.5-beta | v1.12.0 | Faster pipeline (fused upsample + warp, no CPU waits), occlusion only when proven, soft upsample and per-pixel overlay lock |
 | v0.4-beta | v1.10.0 | Frame-border handling, learned static-HUD mask |
 | v0.3-beta | (branch only) | Dense anchored fields splatted to the midpoint, context-ring matching, temporal seeding |
@@ -38,6 +39,49 @@ How the numbers are measured:
 | Live generated frame p50 / p95 | 22.4 / 26.0 ms | 9.0 / 11.7 ms (11.3 / 21.1 with 60 FPS recording) | not measured yet | not measured yet | not measured yet |
 
 **Verdict:** Motion v0.6 ships the Pass 3 picture by default (soft upsample, subtitle guard, frame-edge fade) at the v0.5 P3=7 quality (−0.02 dB Y, +0.01 dB edge) for 1.3 ms less p50 and 3.1 ms less p95. It still costs +2.4 ms p50 / +2.7 ms p95 over v0.5's default (Pass 3 off): the target was +1.0 / +1.5 ms and is missed. The subtitle and the trunk are clean; a faint outline and a small dark square can remain next to the first letter of a subtitle line over moving shadow, where v0.5's overlay lock was cleaner. Apple stays the default until a live A/B.
+
+---
+
+## Motion v0.7-beta (v2.1.0, 2026-11-24): live admission, cuts, side proof
+
+Inputs: the independent v0.6 audit and the live 720p59.7 recording 10-06-16 (10,025 frames). Bench machine: MacBook Air M2, shared with other GPU work; benches run interleaved, and the run order alone moved p50 by ±0.9 ms.
+
+| | Apple | Motion v0.6-beta | **Motion v0.7-beta** |
+|---|---|---|---|
+| GTA Y / edge / steady (300 midpoints) | 28.17 / 26.61 / 24.72 dB | 29.39 / 26.68 / 25.81 dB | **29.40 / 26.69 / 25.81 dB** |
+| Frame p50 / p95, same order (v0.6 first, 3 rounds) | 14.5 / 15.3 ms | 12.51-12.66 / 14.66-18.91 ms | 13.22-14.13 / 19.16-22.84 ms |
+| Frame p50 / p95, reversed order (v0.7 first) | | 13.53 / 18.38 ms | 12.65 / 18.10 ms |
+| GPU p50 (same three rounds) | | 8.66-8.74 ms | 9.14-10.17 ms (reversed order: 8.81 vs 9.63) |
+| Synthetic Y / object / HUD wrong | 19.6 dB / 26.1 dB / 2.58 % | 26.1 / 19.4 dB / 0.00 % | **26.1 / 19.5 dB / 0.00 %** |
+| 4x per t (0.25 / 0.5 / 0.75), Y dB | | 27.16 / 26.55 / 27.34 | 27.18 / 26.54 / 27.33 |
+| 4x pair p50 / p95, GPU p50 / p95 | | 22.62 / 35.07, 18.41 / 29.15 ms | 20.51 / 30.37, 16.39 / 25.20 ms |
+| 20-55-31 @01:45 (every pair, 300) | | 38.06 / 33.56 dB | 38.06 / 33.57 dB |
+| 10-06-16 replay: cuts / repeats / skips (5296 real pairs) | | 0 / 0 / 1 | 2 / 1 / 0 |
+
+Cost: no measurable change; the 10.5 / 12.0 ms target is **missed** (see P2).
+
+### P0: live smoothness
+
+- **Non-blocking admission.** `trySubmit` / `trySubmit4` answer `.busy` at once while a pair holds the engine (the live path shows the real frame instead of waiting up to 250 ms). The pair state (last guide, temporal-seed parity, HUD buffers, pools, a generation id) lives on one serial owner queue; the state flips before the commit, so the completion that releases the slot can never race it. The 250 ms timer is an off-path watchdog: it reports a timeout, resets the seeds and keeps the slot until the GPU work really retires. 30 busy pairs in a row count as one watchdog timeout in the app. Both endpoints are validated, and a failed guide command buffer stops the pair before VideoToolbox.
+- **Hard scene cuts → clean repeat.** Guide texture change ≥ 0.45, histogram distance ≥ 0.45 and ≥ 5 % of cells costing over 0.04: every made frame of the pair is an exact copy of A, seeds reset. Replay of 10-06-16: exactly the two map → menu cuts (107.4 s and 117.9 s, real frames 6407 / 7034); nothing on the GTA clip (max 0.62 / 0.39).
+- **Skipped pairs.** The 572 real → real pairs in 10-06-16 are not rejections: the engine rejects 1 of 5,296 pairs in a faithful replay (43.6 dB agreement with the recorded made frames), and the file has a frame every 10 ticks (16.7 ms) at those places: they are sharp made frames the forensic classifier labelled real. A rejected pair is now a clean repeat of A instead of a skip (`MFG_REJECT=skip` for v0.6).
+- **True midpoint times.** Made frames are stamped halfway between the two real frames' actual times (they arrive 30-37 ms apart), for display and recording; 4x at t of the actual gap. A fixed "newer − 16.7 ms" could fall before the older frame and be dropped by the recorder.
+
+### P1: picture
+
+- **Side proof (on).** A proven one-sided cell now carries the cost of the background vector it actually uses (it carried the cheaper rejected vector's cost, so the fade and the soft upsample treated it as a confident match), and the 1-ring pull no longer hands a proven one-sided cell an unproven vector. This removes the 8-px light square left of the first subtitle letter at 20-55-31 @01:45, which was not glyph leakage: it stays with `MFG_HOLE=0`, `MFG_GGROW=0`, `MFG_GLYPH=0`, `MFG_SOFT=0` and the footprint mask, and goes only with the proof. +0.01 dB GTA, +0.1 dB synthetic object.
+- **Footprint mask (`MFG_GFOOT`, off):** no visible change, −0.02 dB on 20-55-31.
+- **`MFG_SOFTS`:** 0.06 is the value behind the reference triplet; 0.12 gives 29.42 / 26.72 / 25.82 but −0.3 dB on the synthetic object. Unchanged.
+- **x420:** 60 GTA midpoints decoded 10-bit had 146.9 M non-canonical words (all of them); now 0 (+0.01 dB).
+- **Not fixed:** the palm entering at the right edge (153.97 s) is still a semi-transparent smear: an object entering the frame has no match in A, so no vector carries it (the anchored search may not leave the frame). The building patch at 77.5 s and the pillar at 17.75 s look the same as v0.6 in the replay.
+
+### P2: speed (missed)
+
+Exact early exit in the selection (`MFG_SELX`): bit-identical but 0.1 ms slower (texture-latency bound, SIMD divergence). Threadgroup sweeps of `mfg_upwarp` (16×16 4.45 ms best of 6 shapes), `mfg_select` and `mfg_anchor_prop`: the defaults stay. Stage GPU ms (MFG_PROFILE): anchor 1.35 + 3 × 0.65, select 1.44, glyph 0.30, gfinal + gridfix 0.14, warp 4.45.
+
+### P3: 120 FPS (toggle, off by default)
+
+`crossPen` samples the phase's own path and steady glyph pixels blend 1 − t : t (identical at t = 0.5). Not done: one splat traversal for all phases, independent phase emission.
 
 ---
 
