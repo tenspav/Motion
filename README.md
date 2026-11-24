@@ -4,18 +4,18 @@ Motion is a real-time frame-generation engine for Apple silicon. It turns a 30 F
 
 It runs on the GPU (Metal) and the video hardware's motion estimator (VideoToolbox). It works on the decoded YCbCr frames as they are, 8-bit or 10-bit HDR, with no RGB conversion and no Neural Engine. It is one Swift file with no dependencies outside Apple's frameworks.
 
-**Current version: v0.4-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app.
+**Current version: v0.5-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app.
 
 ## How it compares
 
 Apple ships its own interpolator, `VTLowLatencyFrameInterpolation`. On a 1080p30 HDR gameplay recording (GTA VI), MacBook Air M2:
 
-| | Motion v0.4-beta | Apple |
+| | Motion v0.5-beta | Apple |
 |---|---|---|
-| Time to make one frame (median / 95th percentile) | **11.9 / 13.7 ms** | 14.8 / 16.7 ms |
-| Overall picture quality (Y-PSNR) | **28.66 dB** | 28.17 dB |
-| Thin edges: poles, signs, outlines (edge PSNR) | 26.06 dB | **26.61 dB** |
-| Steadiness, frame to frame (higher = less shimmer) | **25.23 dB** | 24.72 dB |
+| Time to make one frame (median / 95th percentile) | **10.4 / 12.5 ms** | 14.8 / 16.7 ms |
+| Overall picture quality (Y-PSNR) | **28.83 dB** | 28.17 dB |
+| Thin edges: poles, signs, outlines (edge PSNR) | 26.21 dB | **26.61 dB** |
+| Steadiness, frame to frame (higher = less shimmer) | **25.44 dB** | 24.72 dB |
 
 The test is harsh on purpose: frames 1 and 3 are used to rebuild frame 2, twice the motion of a live 30 → 60 step. A plain 50/50 blend scores 26.17 / 24.13 dB.
 
@@ -29,6 +29,8 @@ Live, at 60 FPS in a game stream, Motion's lower cost means far fewer frames mis
 These live numbers are from an earlier Motion version (v0.1-beta).
 
 **What it does well:** camera pans, HUD text and icons that stay still, screen edges, thin power lines and car outlines.
+**Extra cleanup (optional, slower):** set `MFG_P3=7` to turn on v0.5's soft upsample, subtitle/overlay lock and frame-edge fade. It removes the blocky artifacts on fast shadows and keeps moving subtitles whole (29.41 dB overall, 26.67 dB edges, ahead of Apple on both), but adds about 4.6 ms per frame, so it is off by default until it is made cheaper.
+
 **Still in progress:**
 - see-through layers over fast motion (a car's shadow on a moving road, a translucent minimap);
 - rows of identical objects;

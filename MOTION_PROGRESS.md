@@ -6,7 +6,8 @@ Motion has its own version number, separate from the FramePortal app it ships in
 
 | Motion | Shipped in FramePortal | Summary |
 |---|---|---|
-| **v0.4-beta** | v1.10.0 | Frame-border handling, learned static-HUD mask |
+| **v0.5-beta** | v1.12.0 | Faster pipeline (fused upsample + warp, no CPU waits), occlusion only when proven, soft upsample and per-pixel overlay lock |
+| v0.4-beta | v1.10.0 | Frame-border handling, learned static-HUD mask |
 | v0.3-beta | (branch only) | Dense anchored fields splatted to the midpoint, context-ring matching, temporal seeding |
 | v0.2-beta | v1.9.4 | 5×5 match window, guarded vector median, confidence fallback |
 | v0.1-beta | v1.8.0 | First engine: VT 16×16 motion, per-pixel selection, YCbCr warp |
@@ -26,16 +27,121 @@ How the numbers are measured:
 
 ## Current standing
 
-| | Apple FrameGen | Motion v0.2-beta | **Motion v0.4-beta** |
-|---|---|---|---|
-| Real footage Y-PSNR | 28.17 dB | 27.85 dB | **28.66 dB** |
-| Real footage edge PSNR | **26.61 dB** | 24.81 dB | 26.06 dB |
-| Steadiness (all pixels) | 24.72 dB | 24.48 dB | **25.23 dB** |
-| Generated frame p50 / p95 (offline bench) | 14.5 / 15.3 ms | ~11 / 15 ms | 12.0 / 13.9 ms |
-| Synthetic HUD pixels wrong | 2.58 % | 7.6 % | **0.00 %** |
-| Live generated frame p50 / p95 | 22.4 / 26.0 ms | 9.0 / 11.7 ms (11.3 / 21.1 with 60 FPS recording) | not measured yet |
+| | Apple FrameGen | Motion v0.2-beta | Motion v0.4-beta | **Motion v0.5-beta** |
+|---|---|---|---|---|
+| Real footage Y-PSNR | 28.17 dB | 27.85 dB | 28.66 dB | **29.41 dB** |
+| Real footage edge PSNR | 26.61 dB | 24.81 dB | 26.06 dB | **26.67 dB** |
+| Steadiness (all pixels) | 24.72 dB | 24.48 dB | 25.23 dB | **25.82 dB** |
+| Generated frame p50 / p95 (offline bench) | 14.5 / 15.3 ms | ~11 / 15 ms | 12.0 / 13.9 ms | about 11.3 / 12.6 ms (busy machine) |
+| Synthetic HUD pixels wrong | 2.58 % | 7.6 % | **0.00 %** | **0.00 %** |
+| Live generated frame p50 / p95 | 22.4 / 26.0 ms | 9.0 / 11.7 ms (11.3 / 21.1 with 60 FPS recording) | not measured yet | not measured yet |
 
-**Verdict:** Motion v0.4 now beats Apple on overall quality and steadiness, and nearly matches it on thin edges. Apple stays the default until v0.4 has been checked live: translucent layers over fast road (a car's shadow, the minimap interior) and repeated objects still show artifacts.
+**Verdict:** Motion v0.5 (Pass 3) beats Apple on overall quality, edge PSNR and steadiness and is still faster. The 8-px blocks and stair steps of the 20-55-31 @01:45 scene are gone in the checked frames, and the subtitle stays whole. What is left: soft smears instead of blocks at the hardest spots, and Pass 3 costs +4.6 ms p50 / +6 ms p95 per made frame, so v0.5-beta ships it OFF (`MFG_P3=0`, the Pass 2 picture) and v0.6 makes it cheaper. Apple stays the default until a live A/B.
+
+---
+
+## Motion v0.5-beta (v1.12.0): faster pipeline, proven occlusion (2026-11-23)
+
+### Pass 1: same output, less time
+
+Each step kept the output (GTA reference clip 28.66 / 26.06 / 25.23 dB; the per-frame values match to 0.001 dB). GPU stage times on an M2, 1080p:
+
+| Step | Before | After |
+|---|---|---|
+| Anchored search: distinct-vector list in threadgroup memory, 8×8 groups, options as pipeline constants | 2.16 ms | 1.33 ms |
+| Upsample: nearest cell from the four already read, duplicate vectors scored once, early exit | 1.57 ms | |
+| Fused upsample + warp (`mfg_upwarp`, `MFG_FUSE=0` for the staged path) | 1.57 + 0.75 ms | about 1.97 ms |
+| Propagation: unrolled 8-neighbour de-duplication | 0.70 ms | 0.63 ms |
+| CPU: no waits (guides start both motion searches, buffers made while they run), one-pass field statistics | 0.29 ms post | 0.26 ms, overlapped |
+| Whole pair, GPU | 8.1 ms | 6.8 ms |
+| Generated frame p50 / p95 (offline bench, quiet machine) | 11.8 / 14.4 ms | 10.4 / 12-13 ms |
+
+The 9-9.5 ms target was not reached. Finding: taking the nearest cell's vector only (no per-pixel choice among four) is faster (0.58 ms warp) and even scores higher (28.75 / 26.17), but its output differs, so it was left out of Pass 1.
+
+### Pass 2: quality
+
+GTA reference clip, 300 midpoints:
+
+| Variant (`MFG_P2`) | Y-PSNR | Edge PSNR | Steadiness |
+|---|---|---|---|
+| v0.4 (`MFG_V04=1`) | 28.66 | 26.06 | 25.23 |
+| proven occlusion only (1) | 28.78 | 26.19 | 25.35 |
+| + interpolated fade cost (3) | 28.80 | 26.21 | 25.34 |
+| + bilinear vector candidate (7) | 28.84 | 26.23 | 25.39 |
+| **default: occlusion + bilinear + sub-pixel + 1-ring pull (85)** | **28.83** | **26.21** | **25.44** |
+| 87 (85 + interpolated fade cost) | 28.86 | 26.25 | 25.44 |
+
+Synthetic bench (default): HUD pixels wrong 0.00 %. The interpolated fade cost (bit 2) blurs the synthetic object (−1.7 dB, HUD 0.10 % wrong), so it stays off. The unique-match margin (bit 8) measured worse (28.49 / 25.95) and added blocks on the roof lights, so it stays off. The 1-ring pull costs 0.10 ms. The edge PSNR target of 26.6 was not reached.
+
+Visual checks, real frames fed back in, v0.4 and v0.5 crops side by side with the recorded frame:
+- **20-55-31 @01:45 (priority):** the dark block above the minimap is nearly gone (a faint smudge), the block left of the subtitle is mostly gone, and dark dropout blocks along the bottom edge are fewer. The 8-px stair steps on fast palm shadows remain, and so do the grey blocks on the right-edge trunk. Two frames later both versions are badly broken (subtitle letters missing, text fragments copied below it). **Not clean: reduced, not gone.**
+- **20-55-31 @01:15:** no regression.
+- **18-11-45 @00:20:** left-edge blocks slightly reduced; road patches about the same.
+- **18-11-45 @01:25:** blocks along the minimap's bottom edge slightly reduced, still visible.
+- **17-32-49 @00:40 (roof lights):** the ghost of the fourth light is reduced. In the frame with the largest motion, dark fragments between the lights remain, slightly fewer.
+
+Open:
+- Fast shadows over road: 8-px stair steps and blocks.
+- Moving subtitles over moving background: broken text in some frames.
+- Contrast-adjusted matching and a per-pixel HUD lock: not attempted.
+- The live cost while recording: not measured.
+
+### Pass 3: soft upsample, overlay lock, frame-edge fade
+
+Design: see "v0.5 Pass 3" in [MOTION.md](MOTION.md). Each change sits behind a bit of `MFG_P3`. **Shipped off by default (`MFG_P3=0`)**: the cost misses the 60 FPS deadline at p95 on an M2 (table below).
+
+GTA reference clip, 300 midpoints:
+
+| Variant (`MFG_P3`) | Y-PSNR | Edge PSNR | Steadiness |
+|---|---|---|---|
+| Pass 2 (0) | 28.83 | 26.21 | 25.44 |
+| frame-edge fade + soft upsample (5) | 29.45 | 26.74 | 25.87 |
+| **default: + overlay lock (7)** | **29.41** | **26.67** | **25.82** |
+| soft upsample on the 2×2 cells only (`MFG_SOFTK=0`) | about 29.27 | 26.56 | 25.69 |
+| + contrast-adjusted match (15) | neutral to −0.02 | | |
+| + HUD cells' moving vector (39) | +0.09 | | |
+
+Synthetic bench (60 runs): Y-PSNR 25.6 → 26.1 dB, object 18.7 → 19.4 dB, HUD pixels wrong 0.00 %. While the HUD mask is still learning (30 runs) the soft upsample first raised HUD errors to 32 %; the unchanged-pixel rule (`MFG_SOFTH`) brought them to 7.7 % (Pass 2: 12.1 %).
+
+Root causes found:
+- **Stair steps:** a hard per-pixel pick among only the 2×2 surrounding cells, plus a per-cell fade cost. Fixed by the soft upsample.
+- **Subtitle breakup:** the warp sampled locked text (often with the other side outside the frame at the bottom edge, where the border branch fell back to B). The semi-transparent first letter differs slightly between frames, so it needed the weak-lock rule.
+- **Edge and trunk blocks:** the border branch. Border pixels had no confidence fade, so a bad one-sided sample was shown at full strength. The fallback cost was not the cause.
+- **Nearest-cell upsample** (the 0.58 ms option from Pass 1): not adopted. It only speeds up the hard path, which the soft upsample replaces wherever cells disagree.
+
+Cost, GPU stage times on an M2, 1080p (machine busy, load 5-8, so the absolute numbers are high; the differences hold across runs):
+
+| Stage | Pass 2 | Pass 3 |
+|---|---|---|
+| Overlay lock | | 0.55 ms |
+| Select (+ lock dilation) | 1.38 ms | 1.65 ms |
+| Upsample + warp | 2.41 ms | 5.47-5.70 ms |
+| Generated frame p50 (synthetic bench) | 6.3-7.5 ms | 11.3-11.6 ms |
+
+#### Pass 3 cost per bit (merge check)
+
+GTA reference clip, 300 midpoints, interleaved runs on the same (busy) M2, made frame p50 / p95 and GPU p50 / p95:
+
+| `MFG_P3` | Y / edge / steady (dB) | Frame ms | GPU ms |
+|---|---|---|---|
+| 0 (Pass 2, shipped default) | 28.83 / 26.21 / 25.44 | 11.0 / 12.8 | 7.3 / 8.7 |
+| 1 (soft upsample) | 29.42 / 26.70 / 25.92 | 13.6 / 16.3 | 9.8 / 12.3 |
+| 3 (+ overlay lock) | 29.41 / 26.65 / 25.91 | 14.7 / 18.3 | 11.0 / 14.2 |
+| 7 (+ frame-edge fade) | 29.41 / 26.67 / 25.82 | 15.7 / 19.0 | 11.7 / 15.0 |
+
+The soft upsample carries the whole score gain; the lock and the edge fade are what clear the subtitle and edge blocks visually. 19 ms p95 misses the 16.7 ms deadline at 60 FPS, so Pass 3 is off by default in v0.5-beta. Next (v0.6): make the soft upsample and the lock cheaper, then turn Pass 3 on.
+
+Visual checks, real frames fed back in, rows A, live recording, v0.4, v0.5 Pass 2, v0.5 Pass 3, B:
+- **20-55-31 @01:45, frames 288 / 292 / 296 (priority):** the bottom-edge blocks, the stair steps on the palm shadows, the grey blocks on the right-edge trunk and the minimap-edge blocks are gone; the road shadows are soft and continuous. The subtitle is whole in all three frames (the first letter "I" included) and no text is copied below it. Left: a faint smear on the trunk in 292 and soft ghosting on the fastest shadows. **Clean in the checked frames.**
+- **20-55-31 @01:15:** no regression; the subtitle and minimap are clean, the small specks on the dirt from v0.4 / Pass 2 are gone.
+- **18-11-45 @00:20:** no regression; the block patches inside the dark car body are gone.
+- **18-11-45 @01:25:** the blocks along the minimap's bottom edge and right of it are gone; a soft grey smear remains under the minimap, where the frame changes most.
+- **17-32-49 @00:40 (roof lights):** the dark fragments between the lights are gone and the outlines are cleaner than v0.4 and Pass 2. A thin halo stays at the fourth light.
+
+Open:
+- The cost: the soft upsample takes about 3 ms more on the GPU. `MFG_SOFTK=0` saves about 2 ms for −0.15 dB.
+- The live cost (playing and while recording at 60 FPS): not measured.
+- Soft smears remain where the frame changes most (no vector explains it): a blend, not a block.
 
 ---
 

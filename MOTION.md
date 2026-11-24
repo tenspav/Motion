@@ -2,7 +2,7 @@
 
 Motion is a real-time frame-generation engine for Apple silicon. It turns a 30 FPS game stream into 60 FPS by building one new frame between every two real frames. It is an alternative to Apple's built-in interpolator (`VTLowLatencyFrameInterpolation`), and it is currently in **beta**. It was built for low-latency PS5 Remote Play streaming and runs in the FramePortal app.
 
-**Current version: Motion v0.4-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
+**Current version: Motion v0.5-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
 
 Engineering log and benchmark history: [MOTION_PROGRESS.md](MOTION_PROGRESS.md).
 
@@ -61,7 +61,25 @@ The block-vector selection above was v0.2's weak point: one winner per pixel amo
    - Long-term means (about 1 s) of the guide and of its edge strength find edges that stay put while the camera moves.
    - A per-cell hysteresis mask keeps those cells on the zero vector, and no splat crosses into or out of them.
 
-Per-stage GPU time on an M2 (1080p):
+### Since v0.5: a faster pipeline, proven occlusion only
+
+- **Fused upsample and warp** (`mfg_upwarp`): one thread per guide pixel picks its vector from the four surrounding grid cells and writes its 2×2 luma block and its CbCr texel, so the per-pixel field never goes through memory. The staged path (`mfg_upsample`, `mfg_warp_y`, `mfg_warp_c`) stays for the debug views, `MFG_REFINE` and `MFG_SMOOTH`.
+- **Anchored search:** the tap spacing, ring and propagation options are pipeline constants; the distinct-vector list lives in threadgroup memory and the kernel runs in 8×8 groups.
+- **No CPU waits:** the guides' completion starts both motion searches; the output buffer and the plane textures are made while they run, and the pair continues on whichever side finishes last. Still one pair in flight.
+- **Occlusion only when proven:** a pixel with no good two-sided match used to take the vector nearest the camera motion and sample one frame only. On fast road this pasted unrelated content (dark 8-px blocks). Now a pixel is one-sided only when one end of the background vector clearly lands on the foreground (foreground match under 0.04, the other end 0.02 worse). Otherwise it keeps its cheapest two-sided match and fades toward the 50/50 blend as before.
+- **Upsample:** the bilinear blend of the four cells' vectors is one more per-pixel candidate (a smooth field keeps its gradient instead of stepping between cells), and a pixel of a one-sided cell takes a two-sided vector when one matches well there.
+- **Sub-pixel fit:** on the last propagation pass, a parabola through the ±0.5 px costs refines confident winners; it is kept only if its own cost is lower.
+- **1-ring pull:** a midpoint cell whose match cost is over 0.08 tries the vectors its 8 neighbours chose (static-HUD cells excluded).
+
+### v0.5 Pass 3: soft upsample, overlay lock, edge fade
+
+- **Why the stair steps:** every full-res pixel picked one vector among the 2×2 surrounding 8-px cells, with that cell's fade cost. On fast shadows over road two vectors match about equally well, so neighbouring pixels flipped between them along the cell grid: an 8-px staircase. A good vector also could not reach past its own cell.
+- **Soft upsample (`P3_SOFT`):** each pixel gathers the vectors of the 3×3 cells around it (a tent 1.5 cells wide), merges vectors closer than 2 px, scores each at the pixel and weights it by `exp(-(c - c_min) / 0.06)`. A clear winner stays a hard edge; a near tie becomes a smooth cross-fade (overlapped block motion compensation). The fade toward the 50/50 blend is mixed the same way, so it has no 8-px steps either. A pixel that did not change and wins on the zero vector keeps it alone (static HUD before the mask has learned it).
+- **Overlay lock (`P3_LOCK`, `mfg_lock` + `mfg_lockdil`):** per full-res pixel, text over a moving background is found without the learned HUD mask: the pixel is nearly equal in A and B (under 0.02), most of its 3×3 neighbours too, and its 4×4 patch holds a bright stroke (over 0.45) next to a dark shadow (under 0.2). Locked pixels take the plain blend of A and B and are never warped. A moving pixel whose vector would sample a locked pixel drops that side (both locked: the blend; the other side outside the frame: the edge row). Weak locks (under 0.15) count only within 3 guide px of a strong one, which keeps semi-transparent strokes whole.
+- **Frame edge (`P3_EDGE`):** border pixels (one end of the vector outside the frame) now fade toward the blend by their match cost like every other pixel, and the two sides are weighted by their distance to the edge instead of switching hard. This removed the grey and dark blocks on the frame edges and the trunk.
+- **Tried, left off:** a contrast-adjusted 5-tap match for ambiguous cells (`MFG_CMATCH`, neutral to slightly worse) and offering a static-HUD cell's moving vector to its pixels (`MFG_HUDPX`, +0.09 dB for +1.4 ms).
+
+Per-stage GPU time on an M2 (1080p, v0.4 before the fused path):
 
 | Stage | Time |
 |---|---|
@@ -145,6 +163,24 @@ These are environment variables for A/B benchmarks. The defaults are what ships.
 | `MFG_HUD` | 1 | Static-HUD mask (v0.4, about 0.3 ms). |
 | `MFG_REFINE` | 0 | Propagation passes. |
 | `MFG_FB0`, `MFG_FB1` | 0.03, 0.08 | Match-cost range over which a pixel fades to a 50/50 blend. |
+| `MFG_FUSE` | 1 | Fused upsample + warp (v0.5); 0 = the staged path, same output. |
+| `MFG_V04` | 0 | 1 = none of the v0.5 quality changes (the v0.4 output, for A/B). |
+| `MFG_P2` | 85 | v0.5 quality changes as a bit mask (1 + 4 + 16 + 64). The per-feature switches below override single bits. |
+| `MFG_OCC` | 1 | Bit 1: one-sided (occlusion) sampling only when proven. `MFG_OCCE` 0.04 / `MFG_OCCM` 0.02 set the proof. |
+| `MFG_UPZ` | 0 | Bit 2: fade cost interpolated between cells (`MFG_UPZM` 1 / 2 / 3). Off: blurs object edges on the synthetic bench. |
+| `MFG_UPSIDE` | 1 | Bit 4: bilinear vector candidate in the upsample, one-sided cells reconsidered per pixel. |
+| `MFG_MARGIN` | 0 | Bit 8: unique-match margin for splat overrides. Off: measured worse (see MOTION_PROGRESS v0.5). |
+| `MFG_SUBPIX` | 1 | Bit 16: parabolic sub-pixel fit (`MFG_SUBC` 0.04: winners under this cost only). |
+| `MFG_HOLE` | 1 | Bit 64: 1-ring pull for midpoint cells over `MFG_HOLEC` (0.08). |
+| `MFG_P3` | 0 | Pass 3 changes as a bit mask. Off by default in v0.5-beta: 7 (all three) costs +4.6 ms p50 / +6 ms p95 per made frame, which misses the 60 FPS deadline on an M2 at p95. Set 7 to try it. The per-feature switches below override single bits. |
+| `MFG_SOFT` | 1 | Bit 1: soft upsample. `MFG_SOFTS` 0.06 (cost scale), `MFG_SOFTK` 1 (3×3 tent; 0 = 2×2 bilinear, about 2 ms faster, −0.2 dB), `MFG_SOFTM` 2 (merge radius, px), `MFG_SOFTH` 0.012 (unchanged-pixel rule). |
+| `MFG_LOCK` | 1 | Bit 2: per-pixel overlay lock. `MFG_LOCKD` 0.02, `MFG_LOCKW` 0.15, `MFG_LOCKC` 0.25 (contrast), `MFG_LOCKB` 0.45 (stroke), `MFG_LOCKK` 0.2 (shadow), `MFG_LOCKSRC` 1 (never sample locked px). |
+| `MFG_EDGE` | 1 | Bit 4: frame-edge fade and distance weighting. |
+| `MFG_CMATCH` | 0 | Bit 8: contrast-adjusted match on ambiguous cells (`MFG_CMT` 0.04). |
+| `MFG_HUDPX` | 0 | Bit 32: static-HUD cells offer their moving vector per pixel. |
+| `MFG_P3DBG` | 0 | Debug views of Pass 3 (1 = lock mask, 5 = fade cost, 9 = raw lock bits). |
+| `MFG_TG` | | Threadgroup shape per kernel for sweeps, e.g. `mfg_anchor=8x8,mfg_upwarp=32x4`. |
+| `MFG_VERBOSE` | 0 | 1 = print shader compile errors. |
 | `FG_DEBUG_VIEW` | 0 | 1 = occlusion map, 2 = horizontal vector, written into the luma plane. |
 
 ## Benchmarks
