@@ -335,7 +335,7 @@ public final class MotionInterpolator: @unchecked Sendable {
     /// Midpoint of (prev, cur) as a new buffer in the decoder's own format (420v / x420), attachments from `cur`.
     /// completion(nil, nil) = pair skipped on purpose (unreliable motion): show the real frame only.
     /// Asynchronous: returns once the guides are queued; the motion search, the GPU passes and the completion follow
-    /// on their own. One pair at a time: a call made before the previous pair's completion waits for it.
+    /// on their own. One pair at a time: a call made before the previous pair's completion waits for it (up to 250 ms, then a timeout error).
     public func interpolate(prev: CVPixelBuffer, cur: CVPixelBuffer, completion: @escaping @Sendable (CVPixelBuffer?, Error?) -> Void) {
         submit(prev: prev, cur: cur, passes: pass1) { outs, err in completion(outs?.first, err) }
     }
@@ -349,7 +349,10 @@ public final class MotionInterpolator: @unchecked Sendable {
 
     private func submit(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
         let tIn = CACurrentMediaTime()
-        inflight.wait()
+        // Bounded: if the previous pair never completes (GPU hang), skip this one with a timeout error.
+        guard inflight.wait(timeout: .now() + .milliseconds(250)) == .success else {
+            return completion(nil, NSError(domain: NSPOSIXErrorDomain, code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "previous pair still running"]))
+        }
         let j = Job(prev: prev, cur: cur, passes: passes) { [inflight] pbs, err in inflight.signal(); completion(pbs, err) }
         let fmt = CVPixelBufferGetPixelFormatType(cur)
         let tenBit = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
