@@ -6,7 +6,8 @@ Motion has its own version number, separate from the FramePortal app it ships in
 
 | Motion | Shipped in FramePortal | Summary |
 |---|---|---|
-| **v0.5-beta** | v1.12.0 | Faster pipeline (fused upsample + warp, no CPU waits), occlusion only when proven, soft upsample and per-pixel overlay lock |
+| **v0.6-beta** | v1.14.0 | Pass 3 on by default and 1.3 ms (p95 3.1 ms) cheaper than v0.5's; pair-local subtitle guard replaces the overlay lock |
+| v0.5-beta | v1.12.0 | Faster pipeline (fused upsample + warp, no CPU waits), occlusion only when proven, soft upsample and per-pixel overlay lock |
 | v0.4-beta | v1.10.0 | Frame-border handling, learned static-HUD mask |
 | v0.3-beta | (branch only) | Dense anchored fields splatted to the midpoint, context-ring matching, temporal seeding |
 | v0.2-beta | v1.9.4 | 5×5 match window, guarded vector median, confidence fallback |
@@ -27,16 +28,76 @@ How the numbers are measured:
 
 ## Current standing
 
-| | Apple FrameGen | Motion v0.2-beta | Motion v0.4-beta | **Motion v0.5-beta** |
-|---|---|---|---|---|
-| Real footage Y-PSNR | 28.17 dB | 27.85 dB | 28.66 dB | **29.41 dB** |
-| Real footage edge PSNR | 26.61 dB | 24.81 dB | 26.06 dB | **26.67 dB** |
-| Steadiness (all pixels) | 24.72 dB | 24.48 dB | 25.23 dB | **25.82 dB** |
-| Generated frame p50 / p95 (offline bench) | 14.5 / 15.3 ms | ~11 / 15 ms | 12.0 / 13.9 ms | about 11.3 / 12.6 ms (busy machine) |
-| Synthetic HUD pixels wrong | 2.58 % | 7.6 % | **0.00 %** | **0.00 %** |
-| Live generated frame p50 / p95 | 22.4 / 26.0 ms | 9.0 / 11.7 ms (11.3 / 21.1 with 60 FPS recording) | not measured yet | not measured yet |
+| | Apple FrameGen | Motion v0.2-beta | Motion v0.4-beta | Motion v0.5-beta (P3=7) | **Motion v0.6-beta** |
+|---|---|---|---|---|---|
+| Real footage Y-PSNR | 28.17 dB | 27.85 dB | 28.66 dB | 29.41 dB | **29.39 dB** |
+| Real footage edge PSNR | 26.61 dB | 24.81 dB | 26.06 dB | 26.67 dB | **26.68 dB** |
+| Steadiness (all pixels) | 24.72 dB | 24.48 dB | 25.23 dB | 25.82 dB | **25.81 dB** |
+| Generated frame p50 / p95 (offline bench) | 14.5 / 15.3 ms | ~11 / 15 ms | 12.0 / 13.9 ms | 14.5 / 18.5 ms (P3 off: 10.9 / 12.7) | **13.3 / 15.4 ms** |
+| Synthetic HUD pixels wrong | 2.58 % | 7.6 % | **0.00 %** | **0.00 %** | **0.00 %** |
+| Live generated frame p50 / p95 | 22.4 / 26.0 ms | 9.0 / 11.7 ms (11.3 / 21.1 with 60 FPS recording) | not measured yet | not measured yet | not measured yet |
 
-**Verdict:** Motion v0.5 (Pass 3) beats Apple on overall quality, edge PSNR and steadiness and is still faster. The 8-px blocks and stair steps of the 20-55-31 @01:45 scene are gone in the checked frames, and the subtitle stays whole. What is left: soft smears instead of blocks at the hardest spots, and Pass 3 costs +4.6 ms p50 / +6 ms p95 per made frame, so v0.5-beta ships it OFF (`MFG_P3=0`, the Pass 2 picture) and v0.6 makes it cheaper. Apple stays the default until a live A/B.
+**Verdict:** Motion v0.6 ships the Pass 3 picture by default (soft upsample, subtitle guard, frame-edge fade) at the v0.5 P3=7 quality (−0.02 dB Y, +0.01 dB edge) for 1.3 ms less p50 and 3.1 ms less p95. It still costs +2.4 ms p50 / +2.7 ms p95 over v0.5's default (Pass 3 off): the target was +1.0 / +1.5 ms and is missed. The subtitle and the trunk are clean; a faint outline and a small dark square can remain next to the first letter of a subtitle line over moving shadow, where v0.5's overlay lock was cleaner. Apple stays the default until a live A/B.
+
+---
+
+## Motion v0.6-beta: experimental 120 FPS (4x mode) (2026-11-24)
+
+Three made frames per real pair (t = 0.25, 0.5, 0.75) for 120 Hz displays, off by default (the app settings, shown only at 120 Hz). Pair-level work runs once; splat, select, grid fix and the warp run per t from time-specialised kernels.
+
+**60 FPS path unchanged:** with the 4x code in, the GTA bench gives the same dB on every one of the 300 midpoints, and the first 120 dumped midpoints are byte-identical PNGs.
+
+GTA VI clip, 4x bench, 150 pairs (frames i and i+4, scored against the real i+1..i+3; four times the live 30 → 120 step):
+
+| t | Motion Y / edge | Plain blend (1 − t)·A + t·B, Y / edge |
+|---|---|---|
+| 0.25 | 27.16 / 24.63 dB | 25.38 / 22.80 dB |
+| 0.50 | 26.55 / 24.07 dB | 24.69 / 22.59 dB |
+| 0.75 | 27.34 / 24.67 dB | 25.42 / 22.76 dB |
+
+Whole pair (three made frames, 1080p, MacBook Air M2, five runs): p50 20.5-22.1 ms, p95 27.3-29.6 ms; GPU p50 / p95 about 17 / 25 ms. The pair must finish within the 33 ms real-frame period, so the cost guard falls back to 60 FPS when the median over 24 pairs passes 25 ms or 6 pairs pass 30 ms. A first try with 20 / 25 ms tripped within 17-23 pairs on this machine; at 25 / 30 ms the replayed guard does not trip on the GTA clip. 4K would cost about four times as much and is expected to fall back on an M2.
+
+Visual (20-55-31 @01:45, pair 72): the three frames step evenly between A and B, the subtitle stays whole in all three; the small ghost left of the first letter (see v0.6 below) shows at t = 0.25 / 0.5 / 0.75 too.
+
+Not checked: live presentation on a 120 Hz display (no session run), recording with 4x on (the recording stays 60 FPS by design).
+
+---
+
+## Motion v0.6-beta (v1.14.0): Pass 3 by default, subtitle guard (2026-11-24)
+
+Bench: the GTA VI clip, 300 midpoints, three interleaved rounds against the v0.5 binary (MacBook Air M2, background load from the network client and a browser). dB are identical in every round; the times are the means of the three rounds.
+
+| Build | Y / edge / steady (dB) | Frame p50 / p95 (ms) | GPU p50 / p95 (ms) |
+|---|---|---|---|
+| v0.5 default (P3 off) | 28.83 / 26.21 / 25.44 | 10.89 / 12.68 | 7.38 / 9.17 |
+| v0.5 P3=7 | 29.41 / 26.67 / 25.82 | 14.51 / 18.47 | 10.96 / 14.79 |
+| **v0.6 default** | **29.39 / 26.68 / 25.81** | **13.25 / 15.36** | **9.63 / 11.60** |
+| v0.6, subtitle guard off (`MFG_GLYPH=0`) | 29.40 / 26.70 / 25.82 | 12.44 / 14.39 | 8.79 / 10.70 |
+| v0.6, shadow retry on (`MFG_SHADOW=1`) | 29.39 / 26.69 / 25.81 | 13.32 / 15.36 | 9.69 / 11.62 |
+
+Gates: Y ≥ 29.36 and edge ≥ 26.62 (the v0.5 P3=7 values minus 0.05) pass. Synthetic HUD pixels wrong: 0.00 % (Y 26.1 dB, as v0.5 P3=7). Cost: missed (target +1.0 / +1.5 ms over the v0.5 default, measured +2.4 / +2.7).
+
+### What changed
+
+- **Soft upsample in registers.** v0.5 gathered up to 10 merged vectors per pixel in a dynamically indexed array; the spilled registers made the warp stage about 4 ms slower than the hard pick. v0.6 streams the 3×3 cells into at most three entries (a cell joins an entry within `max(2 px, 0.3 |v|)` on the same side), scores them at the pixel and warps the three strongest. Tried and dropped: a fixed 9-slot array (as slow), one thread per 2×2 pixels sharing the gather (slower: less parallelism). Cost scale 0.12 (was 0.06) and unchanged-pixel rule 0.004 (was 0.012): +0.04 dB. Two entries instead of three: −0.03 dB, 0.1 ms faster, more 8-px blocks on shadowed road.
+- **Pair-local subtitle guard (`MFG_GLYPH`, replaces the overlay lock).** Per pair, in the lower band of the picture (70-98 % of the height): bright strokes next to dark edges are seeds. A seed is steady (same place, same shape in A and B, not explained by the local world motion), an onset (in B only) or an offset (in A only). Seeds must group (three 8-px bins of 7 along the row) to count; the mask grows over unchanged pixels and bright strokes near a seed bin. Steady pixels take the plain blend, offset pixels take A; a warp never samples a glyph pixel of a frame that holds it (anti-copy: that side is dropped; both sides: the blend). No stacked duplicates in the checked frames. The world vector is the VideoToolbox vector that best explains a 4×4 patch (zero excluded): with the zero vector allowed, every steady subtitle was "explained" and the guard found nothing; with any vector allowed, road grain made false seeds (−0.5 dB). Rows that cannot reach a glyph run a copy of the warp kernel compiled without the guard; the band rows run the guarded kernel only within 48 px of a glyph row of this pair (indirect dispatch). Cost: about 0.85 ms p50 (seeds 0.29 ms, mask 0.13 ms, warp +0.4 ms).
+- **Shadow-over-road zero-mean retry (`MFG_SHADOW`, replaces `MFG_CMATCH`).** A cell whose winner and best-supported neighbour vector differ by more than 1 px and whose windows differ in mean brightness retries both with a zero-mean match; the alternative is admitted only if it is better by a margin, correlates (≥ 0.75) and passes a forward-backward check. Admitted cells keep both endpoints and are not stamped as 8×8 blocks. **Left off:** neutral on the GTA bench (±0.01 dB), no visible change in the palm-shadow crops (it admits almost no cell at these thresholds; looser thresholds were also neutral), +0.1 ms.
+- **Frame-edge fade (`MFG_EDGE`)**, unchanged from v0.5, on.
+- **`MFG_SOFTK`:** the coordinator's run of `MFG_P3=7 MFG_SOFTK=0` on the v0.5 binary gave the exact P3=7 numbers. In this run the switch does reach the kernel on the fused path (60 midpoints, v0.5 binary: 30.01 → 29.86 dB), so the identical result most likely means the variable never got into the bench's environment. In v0.6 the register-only soft path always uses the 3×3 tent; `MFG_SOFTK` applies only to the v0.5 loop (`MFG_SOFTV2=0`).
+
+### Visual checks (rows a / live / v0.5 default / v0.5 P3=7 / v0.6 / b)
+
+| Clip | Verdict |
+|---|---|
+| 20-55-31 @01:45, frames 288 / 292 / 296: palm shadows, subtitle, minimap, trunk | Minimap and trunk as clean as P3=7. Subtitle whole, no duplicate line; a faint outline and a 4-px dark square can stay left of the first letter ("I") over the moving shadow, where P3=7 is clean. Palm shadows over road: soft, a few weak cell edges left (P3=7 has slightly fewer). |
+| 20-55-31 @01:15 | Same as P3=7 (35.34 vs 35.38 dB, edge 31.17 vs 31.03). |
+| 18-11-45 @00:20 and @01:25 | Same as P3=7 (35.44 / 35.52 vs 35.45 / 35.50 dB). Wall texture clean. |
+| 17-32-49 @00:40 (roof, marquee) | Same as P3=7 (26.94 vs 26.95 dB). |
+
+### Still open
+
+- Cost: +2.4 ms p50 over the v0.5 default. The soft upsample itself is about 1.0 ms, the subtitle guard 0.85 ms, the rest is the frame-edge fade and the larger kernel.
+- The first letter of a subtitle line over moving shadow (see above).
 
 ---
 

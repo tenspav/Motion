@@ -22,12 +22,12 @@ public final class MotionInterpolator: @unchecked Sendable {
     }
 
     /// Engine revision (bench header, A/B notes).
-    public static let engineVersion = "0.5-beta"
+    public static let engineVersion = "0.6-beta"
     let size: Size
     let guide: Size
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let psoGuide, psoNeg, psoSelect, psoAnchor, psoAnchorProp, psoSplat, psoUpsample, psoSmooth, psoRefine, psoWarpY, psoWarpC, psoEma, psoUpwarp, psoGridFix, psoLock, psoLockDil: MTLComputePipelineState
+    private let psoGuide, psoNeg, psoSelect, psoAnchor, psoAnchorProp, psoSplat, psoUpsample, psoSmooth, psoRefine, psoWarpY, psoWarpC, psoEma, psoUpwarp, psoGridFix, psoGSeed, psoGFinal, psoUpwarpNG, psoGArgs: MTLComputePipelineState
     private var cache: CVMetalTextureCache?
     private let session: VTMotionEstimationSession
     private var guidePool: CVPixelBufferPool?
@@ -38,8 +38,11 @@ public final class MotionInterpolator: @unchecked Sendable {
     private let smoothTex: MTLTexture
     /// Dense anchored fields A -> B, B -> A (+ propagation scratch) and their midpoint splat buffers.
     private let fTmp: MTLTexture, fTmpB: MTLTexture, gridMid: MTLTexture, gridFix: MTLTexture
-    /// Per guide px: static overlay (text that is the same in both frames over a moving picture), P3_LOCK.
-    private let lockTex: MTLTexture, lockDil: MTLTexture, lockBits: MTLTexture
+    /// Subtitle guard (P3_GLYPH), per guide px (its 2×2 luma px): seed bits and the final glyph mask (bits 0-3: glyph
+    /// in A, 4-7: glyph in B), and per 8×4 guide px bin of the band: any seed (horizontal grouping).
+    private let gSeed: MTLTexture, gMask: MTLTexture, gBins: MTLBuffer, gAny: MTLBuffer, gArgs: MTLBuffer
+    /// Guide rows of the subtitle band [top, bottom).
+    private let band: SIMD2<Int32>
     /// P3_HUDPX: per midpoint cell, the moving vector a static-HUD cell gave up (flag in .w).
     private let gridAlt: MTLTexture
     /// Two sets of anchored fields, alternating per pair: the previous pair's set seeds this pair's search.
@@ -49,6 +52,14 @@ public final class MotionInterpolator: @unchecked Sendable {
     private var fB: MTLTexture { fBs[par] }
     private let gridSize: Size
     private let splatA: MTLBuffer, splatB: MTLBuffer
+    /// One made frame of a pair: its time t and the kernels / splat buffers specialised for it. The 60 FPS path is
+    /// the single t = 0.5 pass; the 4x mode (30 -> 120 FPS) adds t = 0.25 and 0.75 passes, which share the pair's
+    /// work (guides, motion search, anchored fields, subtitle mask, static-HUD evidence) and redo splat, select,
+    /// grid fix and the fused warp only.
+    private struct TPass { let t: Float; let splat, select, gridFix, upwarp, upwarpNG: MTLComputePipelineState; let spA, spB: MTLBuffer }
+    private var pass1: [TPass] = [], pass4: [TPass]?
+    /// True when the 4x passes were built (init with fourX) and the configuration runs the fused path.
+    public var fourX: Bool { pass4 != nil }
     /// Static HUD state per selection cell (float2: evidence level, mask on), two buffers alternating per pair.
     private let hudS: [MTLBuffer]
     /// Long-term means per guide px (float2): the guide, and its gradient magnitude. A static edge keeps its gradient
@@ -150,36 +161,46 @@ public final class MotionInterpolator: @unchecked Sendable {
     /// Upsample and warp in one pass (MFG_FUSE=0: the staged upsample -> field texture -> warp path, which the debug
     /// views, MFG_REFINE and MFG_SMOOTH always use). Same output either way.
     nonisolated(unsafe) static var fuse = ProcessInfo.processInfo.environment["MFG_FUSE"] != "0"
-    /// v0.5 Pass 3 (the 8-px squares), a bit mask (MFG_P3; MFG_V04=1 or MFG_P3=0 = Pass 2 output). Bits: 1 soft
-    /// upsample (MFG_SOFT), 2 per-pixel static-overlay lock (MFG_LOCK), 4 frame-edge fix (MFG_EDGE), 8 contrast-adjusted
-    /// correspondence on ambiguous cells (MFG_CMATCH), 16 nearest-cell upsample (MFG_NEAR). Fused path only.
+    /// Pass 3 (v0.5) and v0.6 picture fixes, a bit mask (MFG_P3; MFG_V04=1 or MFG_P3=0 = the v0.5 Pass 2 output).
+    /// Bits: 1 soft upsample (MFG_SOFT), 2 pair-local subtitle guard (MFG_GLYPH, v0.6; replaces v0.5's overlay lock),
+    /// 4 frame-edge fix (MFG_EDGE), 8 shadow-over-road zero-mean retry (MFG_SHADOW, v0.6; replaces v0.5's MFG_CMATCH),
+    /// 32 static-HUD cells offer their moving vector (MFG_HUDPX). Fused path only.
     nonisolated(unsafe) static var p3: Int32 = {
         let e = ProcessInfo.processInfo.environment
-        var m = Int32(e["MFG_P3"] ?? "0") ?? 0   // off by default: +4.6 ms p50 / +6 ms p95 (MOTION_PROGRESS v0.5 Pass 3)
-        for (k, b) in [("MFG_SOFT", 1), ("MFG_LOCK", 2), ("MFG_EDGE", 4), ("MFG_CMATCH", 8), ("MFG_NEAR", 16), ("MFG_HUDPX", 32)] as [(String, Int32)] {
+        var m = Int32(e["MFG_P3"] ?? "7") ?? 7
+        for (k, b) in [("MFG_SOFT", 1), ("MFG_GLYPH", 2), ("MFG_EDGE", 4), ("MFG_SHADOW", 8), ("MFG_HUDPX", 32)] as [(String, Int32)] {
             if e[k] == "0" { m &= ~b } else if e[k] == "1" { m |= b }
         }
         return m
     }()
-    /// Pass 3 tuning (bench A/B): soft-upsample cost scale, lock thresholds (A/B difference, local contrast).
+    /// Pass 3 tuning (bench A/B): soft-upsample cost scale; spare.
     nonisolated(unsafe) static var p3f: SIMD4<Float> = {
         let e = ProcessInfo.processInfo.environment
         func f(_ k: String, _ d: Float) -> Float { Float(e[k] ?? "") ?? d }
-        return SIMD4(f("MFG_SOFTS", 0.06), f("MFG_LOCKD", 0.02), f("MFG_LOCKC", 0.25), f("MFG_CMT", 0.04))
+        return SIMD4(f("MFG_SOFTS", 0.06), 0, 0, 0)
+    }()
+    /// Subtitle / pop-up UI band of the subtitle guard, as fractions of the frame height (MFG_GBAND "top,bottom").
+    nonisolated(unsafe) static var glyphBand: SIMD2<Float> = {
+        let p = (ProcessInfo.processInfo.environment["MFG_GBAND"] ?? "0.70,0.98").split(separator: ",").compactMap { Float($0) }
+        return p.count == 2 && p[0] < p[1] ? SIMD2(max(0, p[0]), min(1, p[1])) : SIMD2(0.70, 0.98)
     }()
 
     static var isSupported: Bool { MTLCreateSystemDefaultDevice() != nil }
+    /// The 4x passes need the fused, splatted grid path (the default configuration).
+    static var canFourX: Bool { fuse && splat && grid > 1 && refinePasses == 0 && !smooth && debugView == 0 }
 
     public convenience init?(width: Int, height: Int) { self.init(size: Size(width, height)) }
 
-    public init?(size: Size) {
+    public init?(size: Size, fourX: Bool = false) {
         guard size.width % 4 == 0, size.height % 4 == 0, size.width <= 3840,
               let dev = MTLCreateSystemDefaultDevice(), let q = dev.makeCommandQueue() else { return nil }
         self.size = size
         guide = Size(size.width / 2, size.height / 2)
         device = dev; queue = q
+        var extraPSO: [(Float, [MTLComputePipelineState])] = []
         do {
-            let lib = try dev.makeLibrary(source: Self.shaders, options: nil)
+            let lopt = MTLCompileOptions(); lopt.preprocessorMacros = ["SOFTN": NSNumber(value: Int(ProcessInfo.processInfo.environment["MFG_SOFTN"] ?? "") ?? 10)]
+            let lib = try dev.makeLibrary(source: Self.shaders, options: lopt)
             let fc = MTLFunctionConstantValues()
             var bo = Self.border
             fc.setConstantValue(&bo, type: .bool, index: 0)
@@ -194,34 +215,60 @@ public final class MotionInterpolator: @unchecked Sendable {
             var uz = Self.upZ; fc.setConstantValue(&uz, type: .int, index: 9)
             var sc = Self.subC; fc.setConstantValue(&sc, type: .float, index: 10)
             var p3 = Self.p3; fc.setConstantValue(&p3, type: .int, index: 11)
-            var p3f = Self.p3f
-            fc.setConstantValue(&p3f.x, type: .float, index: 12); fc.setConstantValue(&p3f.y, type: .float, index: 13)
-            fc.setConstantValue(&p3f.z, type: .float, index: 14); fc.setConstantValue(&p3f.w, type: .float, index: 15)
-            var ssd = ProcessInfo.processInfo.environment["MFG_SOFTSIDE"] != "0"; fc.setConstantValue(&ssd, type: .bool, index: 16)
-            var p3d = Int32(ProcessInfo.processInfo.environment["MFG_P3DBG"] ?? "0") ?? 0; fc.setConstantValue(&p3d, type: .int, index: 17)
-            var sz = Int32(ProcessInfo.processInfo.environment["MFG_SOFTZ"] ?? "0") ?? 0; fc.setConstantValue(&sz, type: .int, index: 18)
-            var sk = ProcessInfo.processInfo.environment["MFG_SOFTK"] != "0"; fc.setConstantValue(&sk, type: .bool, index: 19)
-            var zs = ProcessInfo.processInfo.environment["MFG_SOFTZS"] != "0"; fc.setConstantValue(&zs, type: .bool, index: 20)
-            var sm = Float(ProcessInfo.processInfo.environment["MFG_SOFTM"] ?? "2") ?? 2; fc.setConstantValue(&sm, type: .float, index: 21)
-            var scc = ProcessInfo.processInfo.environment["MFG_SOFTC"] == "1"; fc.setConstantValue(&scc, type: .bool, index: 22)
-            var lg = Float(ProcessInfo.processInfo.environment["MFG_LOCKG"] ?? "1") ?? 1; fc.setConstantValue(&lg, type: .float, index: 23)
-            var lw = Float(ProcessInfo.processInfo.environment["MFG_LOCKW"] ?? "0.15") ?? 0.15; fc.setConstantValue(&lw, type: .float, index: 24)
-            var lsr = ProcessInfo.processInfo.environment["MFG_LOCKSRC"] != "0"; fc.setConstantValue(&lsr, type: .bool, index: 25)
-            var lb = Float(ProcessInfo.processInfo.environment["MFG_LOCKB"] ?? "0.45") ?? 0.45; fc.setConstantValue(&lb, type: .float, index: 26)
-            var lk = Float(ProcessInfo.processInfo.environment["MFG_LOCKK"] ?? "0.2") ?? 0.2; fc.setConstantValue(&lk, type: .float, index: 27)
-            var sh = Float(ProcessInfo.processInfo.environment["MFG_SOFTH"] ?? "0.012") ?? 0.012; fc.setConstantValue(&sh, type: .float, index: 28)
+            let env = ProcessInfo.processInfo.environment
+            func cf(_ v: Float, _ i: Int) { var x = v; fc.setConstantValue(&x, type: .float, index: i) }
+            func ci(_ v: Int32, _ i: Int) { var x = v; fc.setConstantValue(&x, type: .int, index: i) }
+            func cb(_ v: Bool, _ i: Int) { var x = v; fc.setConstantValue(&x, type: .bool, index: i) }
+            func ef(_ k: String, _ d: Float) -> Float { Float(env[k] ?? "") ?? d }
+            func ei(_ k: String, _ d: Int32) -> Int32 { Int32(env[k] ?? "") ?? d }
+            cf(Self.p3f.x, 12)
+            // Subtitle guard (v0.6): stroke strength, same centre, same shape, world-patch margin, bins, world motion.
+            cf(ef("MFG_GSTROKE", 0.035), 13); cf(ef("MFG_GCENTER", 0.012), 14); cf(ef("MFG_GSHAPE", 0.025), 15)
+            cb(env["MFG_SOFTSIDE"] != "0", 16)
+            ci(ei("MFG_P3DBG", 0), 17)
+            ci(ei("MFG_SOFTZ", 0), 18)
+            cb(env["MFG_SOFTK"] != "0", 19)
+            cb(env["MFG_SOFTZS"] != "0", 20)
+            cf(ef("MFG_SOFTM", 2), 21)
+            ci(ei("MFG_SOFTC", 0), 22)
+            cf(ef("MFG_GWORLD", 0.02), 23); ci(ei("MFG_GBINS", 3), 24); cf(ef("MFG_GMOVE", 2), 25)
+            // Shadow retry (v0.6): trigger (raw cost, mean change), admission (correlation, zero-mean cost, margin).
+            cf(ef("MFG_SHE", 0.025), 26); cf(ef("MFG_SHMD", 0.015), 27)
+            cf(ef("MFG_SOFTH", 0.004), 28)
+            cf(ef("MFG_SHCORR", 0.75), 29); cf(ef("MFG_SHEZ", 0.012), 30); cf(ef("MFG_SHMARGIN", 0.004), 31)
+            ci(ei("MFG_SOFTFAST", 1), 32)
+            cf(ef("MFG_SHTEX", 0.012), 33)
+            cb(env["MFG_GONSET"] != "0", 34)
+            ci(ei("MFG_SHFB", 1), 35)
+            cf(ef("MFG_SOFTKMIN", 0), 36)
+            cf(ef("MFG_GBRIGHT", 0.45), 37)
+            cb(env["MFG_SOFTV2"] != "0", 38); ci(ei("MFG_SOFTTOP", 3), 39); cf(ef("MFG_SOFTMR", 0.3), 40); cb(false, 41); cb(env["MFG_GFINE"] == "1", 42); cb(env["MFG_GGROW"] != "0", 43)
             // Threadgroup shape per kernel (bench sweep: MFG_TG="mfg_anchor=16x8,mfg_upwarp=32x4"; default 16×16).
             let tgEnv = (ProcessInfo.processInfo.environment["MFG_TG"] ?? "").split(separator: ",").reduce(into: [String: MTLSize]()) {
                 let kv = $1.split(separator: "="), wh = kv.count == 2 ? kv[1].split(separator: "x").compactMap { Int($0) } : []
                 if wh.count == 2 { $0[String(kv[0])] = MTLSize(width: wh[0], height: wh[1], depth: 1) }
             }
             var tgs: [ObjectIdentifier: MTLSize] = [:]
+            var tHalf: Float = 0.5, pairWork = true
+            fc.setConstantValue(&tHalf, type: .float, index: 44); fc.setConstantValue(&pairWork, type: .bool, index: 45)
             func pso(_ n: String) throws -> MTLComputePipelineState {
                 let p = try dev.makeComputePipelineState(function: lib.makeFunction(name: n, constantValues: fc))
                 if let t = tgEnv[n] ?? Self.defaultTG[n] { tgs[ObjectIdentifier(p)] = t }
                 return p
             }
-            psoGuide = try pso("mfg_guide"); psoNeg = try pso("mfg_neg"); psoSelect = try pso("mfg_select"); psoAnchor = try pso("mfg_anchor"); psoUpsample = try pso("mfg_upsample"); psoAnchorProp = try pso("mfg_anchor_prop"); psoSplat = try pso("mfg_splat"); psoSmooth = try pso("mfg_smooth"); psoRefine = try pso("mfg_refine"); psoWarpY = try pso("mfg_warp_y"); psoWarpC = try pso("mfg_warp_c"); psoEma = try pso("mfg_ema"); psoUpwarp = try pso("mfg_upwarp"); psoGridFix = try pso("mfg_gridfix"); psoLock = try pso("mfg_lock"); psoLockDil = try pso("mfg_lockdil")
+            psoGuide = try pso("mfg_guide"); psoNeg = try pso("mfg_neg"); psoSelect = try pso("mfg_select"); psoAnchor = try pso("mfg_anchor"); psoUpsample = try pso("mfg_upsample"); psoAnchorProp = try pso("mfg_anchor_prop"); psoSplat = try pso("mfg_splat"); psoSmooth = try pso("mfg_smooth"); psoRefine = try pso("mfg_refine"); psoWarpY = try pso("mfg_warp_y"); psoWarpC = try pso("mfg_warp_c"); psoEma = try pso("mfg_ema"); psoUpwarp = try pso("mfg_upwarp"); psoGridFix = try pso("mfg_gridfix"); psoGSeed = try pso("mfg_gseed"); psoGFinal = try pso("mfg_gfinal"); psoGArgs = try pso("mfg_gargs")
+            var ng = true; fc.setConstantValue(&ng, type: .bool, index: 41)
+            psoUpwarpNG = try pso("mfg_upwarp")
+            if fourX && Self.canFourX {
+                for t: Float in [0.25, 0.75] {
+                    var tv = t, pw = false, g = false
+                    fc.setConstantValue(&tv, type: .float, index: 44); fc.setConstantValue(&pw, type: .bool, index: 45)
+                    fc.setConstantValue(&g, type: .bool, index: 41)
+                    let k = [try pso("mfg_splat"), try pso("mfg_select"), try pso("mfg_gridfix"), try pso("mfg_upwarp")]
+                    g = true; fc.setConstantValue(&g, type: .bool, index: 41)
+                    extraPSO.append((t, k + [try pso("mfg_upwarp")]))
+                }
+            }
             session = try VTMotionEstimationSession(width: UInt32(guide.width), height: UInt32(guide.height),
                                                     motionVectorSize: Self.smallBlocks ? .blockSize4x4 : .blockSize16x16, useMultiPassSearch: Self.multiPass, label: "Motion")
             tg = tgs
@@ -234,10 +281,14 @@ public final class MotionInterpolator: @unchecked Sendable {
         guard let t = dev.makeTexture(descriptor: md), let t2 = dev.makeTexture(descriptor: md),
               let b = dev.makeBuffer(length: 4, options: .storageModeShared) else { return nil }
         midTex = t; smoothTex = t2; badCount = b
-        let ld = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: guide.width, height: guide.height, mipmapped: false)
+        let ld = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Uint, width: guide.width, height: guide.height, mipmapped: false)
         ld.usage = [.shaderRead, .shaderWrite]; ld.storageMode = .private
-        guard let lt = dev.makeTexture(descriptor: ld), let lt3 = dev.makeTexture(descriptor: ld), let lt4 = dev.makeTexture(descriptor: ld) else { return nil }
-        lockTex = lt; lockDil = lt3; lockBits = lt4
+        band = SIMD2(Int32((Float(guide.height) * Self.glyphBand.x).rounded(.down)), Int32((Float(guide.height) * Self.glyphBand.y).rounded(.up)))
+        guard let lt = dev.makeTexture(descriptor: ld), let lt3 = dev.makeTexture(descriptor: ld),
+              let gbuf = dev.makeBuffer(length: max(4, ((guide.width + 7) / 8) * ((Int(band.y - band.x) + 3) / 4) * 4), options: .storageModePrivate) else { return nil }
+        guard let ganyb = dev.makeBuffer(length: 16, options: .storageModePrivate),
+              let gargs = dev.makeBuffer(length: 48, options: .storageModePrivate) else { return nil }
+        gSeed = lt; gMask = lt3; gBins = gbuf; gAny = ganyb; gArgs = gargs
         gridSize = Size((guide.width + Self.grid - 1) / Self.grid, (guide.height + Self.grid - 1) / Self.grid)
         let gd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: gridSize.width, height: gridSize.height, mipmapped: false)
         gd.usage = [.shaderRead, .shaderWrite]; gd.storageMode = .private
@@ -251,6 +302,16 @@ public final class MotionInterpolator: @unchecked Sendable {
               let h2 = dev.makeBuffer(length: guide.width * guide.height * 8, options: .storageModePrivate),
               let em = dev.makeBuffer(length: guide.width * guide.height * 8, options: .storageModePrivate) else { return nil }
         fAs = [a1, a6]; fBs = [a2, a7]; fTmp = a3; fTmpB = a5; gridMid = a4; gridFix = a8; gridAlt = a9; splatA = s1; splatB = s2; hudS = [h1, h2]; emaBuf = em
+        let mid = TPass(t: 0.5, splat: psoSplat, select: psoSelect, gridFix: psoGridFix, upwarp: psoUpwarp, upwarpNG: psoUpwarpNG, spA: s1, spB: s2)
+        pass1 = [mid]
+        if extraPSO.count == 2 {
+            var q: [TPass] = []
+            for (t, k) in extraPSO {
+                guard let a = dev.makeBuffer(length: s1.length, options: .storageModePrivate), let b = dev.makeBuffer(length: s1.length, options: .storageModePrivate) else { return nil }
+                q.append(TPass(t: t, splat: k[0], select: k[1], gridFix: k[2], upwarp: k[3], upwarpNG: k[4], spA: a, spB: b))
+            }
+            pass4 = [q[0], mid, q[1]]
+        }
         CVMetalTextureCacheCreate(nil, nil, dev, nil, &cache)
     }
 
@@ -276,9 +337,20 @@ public final class MotionInterpolator: @unchecked Sendable {
     /// Asynchronous: returns once the guides are queued; the motion search, the GPU passes and the completion follow
     /// on their own. One pair at a time: a call made before the previous pair's completion waits for it.
     public func interpolate(prev: CVPixelBuffer, cur: CVPixelBuffer, completion: @escaping @Sendable (CVPixelBuffer?, Error?) -> Void) {
+        submit(prev: prev, cur: cur, passes: pass1) { outs, err in completion(outs?.first, err) }
+    }
+
+    /// 4x mode (30 -> 120 FPS): the frames at t = 0.25, 0.5 and 0.75 of (prev, cur), in that order, from one pair's
+    /// motion work. Needs `fourX` (init with fourX: true); otherwise only the midpoint. completion(nil, nil) = pair
+    /// skipped on purpose, as for `interpolate`.
+    public func interpolate4(prev: CVPixelBuffer, cur: CVPixelBuffer, completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
+        submit(prev: prev, cur: cur, passes: pass4 ?? pass1, completion: completion)
+    }
+
+    private func submit(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
         let tIn = CACurrentMediaTime()
         inflight.wait()
-        let j = Job(prev: prev, cur: cur) { [inflight] pb, err in inflight.signal(); completion(pb, err) }
+        let j = Job(prev: prev, cur: cur, passes: passes) { [inflight] pbs, err in inflight.signal(); completion(pbs, err) }
         let fmt = CVPixelBufferGetPixelFormatType(cur)
         let tenBit = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
         guard started, CVPixelBufferGetWidth(cur) == size.width, CVPixelBufferGetHeight(cur) == size.height,
@@ -333,13 +405,15 @@ public final class MotionInterpolator: @unchecked Sendable {
         cmd0.commit()
 
         // While the guides and the motion search run: the output buffer and the plane textures.
-        var outPB: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, outPool!, &outPB)
-        j.out = outPB
-        if let out = outPB {
+        for _ in j.passes {
+            var outPB: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, outPool!, &outPB)
+            guard let out = outPB, let y = tex(j, out, 0, yFmt), let c = tex(j, out, 1, cFmt) else { break }
+            j.outs.append(out); j.yOs.append(y); j.cOs.append(c)
+        }
+        if j.outs.count == j.passes.count {
             j.ga = guideTex(j, gA); j.gb = guideTex(j, gB)
             j.yA = tex(j, prev, 0, yFmt); j.cA = tex(j, prev, 1, cFmt); j.yB = tex(j, cur, 0, yFmt); j.cB = tex(j, cur, 1, cFmt)
-            j.yO = tex(j, out, 0, yFmt); j.cO = tex(j, out, 1, cFmt)
         }
         if j.arrive() { run(j) }
     }
@@ -348,15 +422,17 @@ public final class MotionInterpolator: @unchecked Sendable {
     /// (frame textures, motion search) still running.
     private final class Job: @unchecked Sendable {
         let prev: CVPixelBuffer, cur: CVPixelBuffer
-        let done: @Sendable (CVPixelBuffer?, Error?) -> Void
+        let passes: [TPass]
+        let done: @Sendable ([CVPixelBuffer]?, Error?) -> Void
         var keep: [CVMetalTexture] = []
         var vA: CVPixelBuffer?, vB: CVPixelBuffer?, error: Error?
-        var out: CVPixelBuffer?
-        var ga, gb, yA, cA, yB, cB, yO, cO: MTLTexture?
+        var outs: [CVPixelBuffer] = []
+        var yOs: [MTLTexture] = [], cOs: [MTLTexture] = []
+        var ga, gb, yA, cA, yB, cB: MTLTexture?
         private var pending = 2
         private let lock = NSLock()
-        init(prev: CVPixelBuffer, cur: CVPixelBuffer, done: @escaping @Sendable (CVPixelBuffer?, Error?) -> Void) {
-            self.prev = prev; self.cur = cur; self.done = done
+        init(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], done: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
+            self.prev = prev; self.cur = cur; self.passes = passes; self.done = done
         }
         /// True for the side that completes the pair's preparation.
         func arrive() -> Bool { lock.lock(); defer { lock.unlock() }; pending -= 1; return pending == 0 }
@@ -385,14 +461,16 @@ public final class MotionInterpolator: @unchecked Sendable {
         let prev = j.prev, cur = j.cur, completion = j.done
         guard let vBpb = j.vB else { return completion(nil, j.error ?? Self.err("motion")) }
         let vApb = j.vA
-        guard let out = j.out, let ga = j.ga, let gb = j.gb,
+        guard j.outs.count == j.passes.count, let ga = j.ga, let gb = j.gb,
               let vb = tex(j, vBpb, 0, .rg16Float), let va = vApb.flatMap({ tex(j, $0, 0, .rg16Float) }) ?? negField(vb.width, vb.height),
-              let yA = j.yA, let cA = j.cA, let yB = j.yB, let cB = j.cB, let yO = j.yO, let cO = j.cO,
+              let yA = j.yA, let cA = j.cA, let yB = j.yB, let cB = j.cB,
               var cmd = queue.makeCommandBuffer()
         else { return completion(nil, Self.err("textures")) }
         _ = (prev, cur)
-        if Self.splat || hudClear, let bl = cmd.makeBlitCommandEncoder() {
-            if Self.splat { bl.fill(buffer: splatA, range: 0..<splatA.length, value: 0); bl.fill(buffer: splatB, range: 0..<splatB.length, value: 0) }
+        let glyph = (Self.p3 & 2) != 0 && band.y > band.x
+        if Self.splat || hudClear || glyph, let bl = cmd.makeBlitCommandEncoder() {
+            if Self.splat { for tp in j.passes { bl.fill(buffer: tp.spA, range: 0..<tp.spA.length, value: 0); bl.fill(buffer: tp.spB, range: 0..<tp.spB.length, value: 0) } }
+            if glyph { bl.fill(buffer: gBins, range: 0..<gBins.length, value: 0); bl.fill(buffer: gAny, range: 0..<16, value: 0); bl.fill(buffer: gAny, range: 4..<8, value: 0xFF) }
             if hudClear { for b in hudS { bl.fill(buffer: b, range: 0..<b.length, value: 0) } }
             bl.endEncoding()
         }
@@ -416,11 +494,16 @@ public final class MotionInterpolator: @unchecked Sendable {
             barrier()
         }
         badCount.contents().storeBytes(of: UInt32(0), as: UInt32.self)
-        if (Self.p3 & 2) != 0 {
-            e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(lockTex, index: 2)
+        var bandRows = band
+        if glyph {
+            // Subtitle guard seeds (band rows only), concurrent with the anchored search: strokes in A and B, the
+            // VideoToolbox field as the local world motion.
+            var blkG = SIMD2<Float>(Float(guide.width) / Float(vb.width), Float(guide.height) / Float(vb.height))
+            e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(vb, index: 2); e.setTexture(gSeed, index: 3)
             e.setTexture(ga, index: 4); e.setTexture(gb, index: 5)
-            dispatch(e, psoLock, guide)
-            if Self.profile { cut("lock") }
+            e.setBuffer(gBins, offset: 0, index: 0); e.setBytes(&bandRows, length: 8, index: 1); e.setBytes(&blkG, length: 8, index: 2)
+            dispatch(e, psoGSeed, Size(guide.width, Int(band.y - band.x)))
+            if Self.profile { cut("glyph") }
         }
         if Self.trace { Self.lastField = Size(vb.width, vb.height) }
         var blk = SIMD2<Float>(Float(guide.width) / Float(vb.width), Float(guide.height) / Float(vb.height))   // guide px per vector cell
@@ -431,6 +514,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         var opt = SIMD2<Int32>(Self.candRadius, Self.wideSAD)
         var lam = Self.lambda
         var G = Float(Self.grid)
+        var splatSides: [(F: MTLTexture, sgn: Float)] = []
         if Self.splat {
             // Dense anchored fields A -> B and B -> A on the grid, propagated, splatted to the midpoint.
             // Ping-pong so that the last pass lands in F.
@@ -460,13 +544,20 @@ public final class MotionInterpolator: @unchecked Sendable {
                 }
             }
             cut(n == 0 ? "anchor0" : "anchorP")
-            for sd in sides {
+            splatSides = sides.map { ($0.F, $0.sgn) }
+        }
+        // One pass per made frame (t = 0.5 alone at 60 FPS; 0.25, 0.5, 0.75 in the 4x mode).
+        for (pi, tp) in j.passes.enumerated() {
+        let yO = j.yOs[pi], cO = j.cOs[pi]
+        if pi > 0 { barrier() }
+        if Self.splat {
+            for sd in splatSides {
                 var spp = SIMD4<Float>(glob.x, glob.y, sd.sgn, Self.splatMaxCost)
-                e.setTexture(sd.F, index: 0); e.setBuffer(sd.buf, offset: 0, index: 0); e.setBytes(&spp, length: 16, index: 1)
+                e.setTexture(sd.F, index: 0); e.setBuffer(sd.sgn < 0 ? tp.spA : tp.spB, offset: 0, index: 0); e.setBytes(&spp, length: 16, index: 1)
                 e.setBytes(&G, length: 4, index: 2)
                 e.setTexture(sd.F === fA ? fB : fA, index: 1)
                 e.setBuffer(hudS[hudPar], offset: 0, index: 3); e.setBytes(&hudOn, length: 4, index: 4)
-                dispatch(e, psoSplat, gridSize)
+                dispatch(e, tp.splat, gridSize)
             }
             cut("splat")
         }
@@ -478,26 +569,29 @@ public final class MotionInterpolator: @unchecked Sendable {
         e.setBuffer(badCount, offset: 0, index: 1)
         var spOn = SIMD4<Float>(Self.splat ? 1 : 0, 0, Self.splat ? G : 1, Self.splatHard)
         e.setTexture(fA, index: 5); e.setTexture(fB, index: 6)
-        e.setBuffer(splatA, offset: 0, index: 5); e.setBuffer(splatB, offset: 0, index: 6); e.setBytes(&spOn, length: 16, index: 7)
+        e.setBuffer(tp.spA, offset: 0, index: 5); e.setBuffer(tp.spB, offset: 0, index: 6); e.setBytes(&spOn, length: 16, index: 7)
         e.setBytes(&glob, length: 8, index: 2)
         e.setBytes(&opt, length: 8, index: 3)
         e.setBytes(&lam, length: 4, index: 4)
         e.setBuffer(hudS[hudPar], offset: 0, index: 8); e.setBuffer(hudS[1 - hudPar], offset: 0, index: 9); e.setBytes(&hudOn, length: 4, index: 10)
         e.setBuffer(emaBuf, offset: 0, index: 11)
         e.setTexture(gridAlt, index: 7)
-        dispatch(e, psoSelect, selSize)
-        if (Self.p3 & 2) != 0 {                           // the lock mask was written before the anchored search
-            e.setTexture(lockTex, index: 0); e.setTexture(lockDil, index: 1); e.setTexture(lockBits, index: 2)
-            dispatch(e, psoLockDil, guide)
-        }
-        if selOut === gridMid && (Self.p2 & 64) != 0 {
+        dispatch(e, tp.select, selSize)
+        if selOut === gridMid && ((Self.p2 & 64) != 0 || (Self.p3 & 8) != 0) {
             cut("select")
             var th = SIMD2<Float>(Self.holeCost, 0.06)
             e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(gridMid, index: 2); e.setTexture(gridFix, index: 3)
+            e.setTexture(fA, index: 4); e.setTexture(fB, index: 5)
             e.setBytes(&G, length: 4, index: 0); e.setBuffer(hudS[hudPar], offset: 0, index: 1); e.setBytes(&hudOn, length: 4, index: 2)
             e.setBytes(&th, length: 8, index: 3)
-            dispatch(e, psoGridFix, gridSize)
+            dispatch(e, tp.gridFix, gridSize)
             selOut = gridFix
+        }
+        if glyph && pi == 0 {                            // grouped, grown glyph mask (seeds written long before)
+            e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(gSeed, index: 2); e.setTexture(gMask, index: 3)
+            e.setBuffer(gBins, offset: 0, index: 0); e.setBytes(&bandRows, length: 8, index: 1); e.setBuffer(gAny, offset: 0, index: 2)
+            dispatch(e, psoGFinal, Size(guide.width, Int(band.y - band.x)))
+            if Self.profile { cut("gfinal") }
         }
         var fb = Self.fallback
         let fused = Self.fuse && selOut !== midTex && Self.refinePasses == 0 && !Self.smooth && Self.debugView == 0
@@ -507,8 +601,43 @@ public final class MotionInterpolator: @unchecked Sendable {
             e.setTexture(yA, index: 3); e.setTexture(yB, index: 4); e.setTexture(yO, index: 5)
             e.setTexture(cA, index: 6); e.setTexture(cB, index: 7); e.setTexture(cO, index: 8)
             e.setBytes(&G, length: 4, index: 0); e.setBytes(&fb, length: 8, index: 1)
-            e.setTexture(lockDil, index: 9); e.setTexture(lockBits, index: 10); e.setTexture(lockTex, index: 12); e.setTexture(gridAlt, index: 11)
-            dispatch(e, psoUpwarp, guide)
+            e.setTexture(gMask, index: 9); e.setTexture(gridAlt, index: 11)
+            var bandUse = glyph ? band : SIMD2<Int32>(0, 0)
+            e.setBytes(&bandUse, length: 8, index: 2)
+            var rt = Int32(ProcessInfo.processInfo.environment["MFG_RT"] ?? "0") ?? 0
+            e.setBytes(&rt, length: 4, index: 3); e.setBuffer(gAny, offset: 0, index: 4)
+            // Rows whose warp cannot reach the subtitle band (more than 48 guide px above it) run a copy of the
+            // kernel compiled without the glyph code: its registers and lookups cost about 0.8 ms over the frame.
+            let split = glyph ? max(0, min(guide.height, Int(band.x) - 48)) : guide.height
+            var off: Int32 = 0
+            if split > 0 {
+                e.setBytes(&off, length: 4, index: 5)
+                dispatch(e, tp.upwarpNG, Size(guide.width, split))
+            }
+            if split < guide.height {
+                off = Int32(split); e.setBytes(&off, length: 4, index: 5)
+                if glyph {
+                    // The band rows run the glyph kernel only when this pair found a glyph (anyG); otherwise the
+                    // same rows run the plain copy. gargs writes both indirect grids (one of them empty).
+                    let t = tg[ObjectIdentifier(tp.upwarp)] ?? MTLSize(width: 16, height: 16, depth: 1)
+                    var n = SIMD4<UInt32>(UInt32((guide.width + t.width - 1) / t.width), UInt32(t.height), UInt32(split), UInt32(guide.height))
+                    e.setComputePipelineState(psoGArgs)
+                    e.setBuffer(gAny, offset: 0, index: 0); e.setBuffer(gArgs, offset: 0, index: 1); e.setBytes(&n, length: 16, index: 2)
+                    e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                    barrier()
+                    e.setBytes(&G, length: 4, index: 0); e.setBytes(&fb, length: 8, index: 1); e.setBytes(&bandUse, length: 8, index: 2)
+                    e.setComputePipelineState(tp.upwarp)
+                    e.setBuffer(gArgs, offset: 36, index: 5)
+                    e.dispatchThreadgroups(indirectBuffer: gArgs, indirectBufferOffset: 0, threadsPerThreadgroup: t)
+                    e.setComputePipelineState(tp.upwarpNG)
+                    e.setBuffer(gArgs, offset: 40, index: 5)
+                    e.dispatchThreadgroups(indirectBuffer: gArgs, indirectBufferOffset: 12, threadsPerThreadgroup: t)
+                    e.setBuffer(gArgs, offset: 44, index: 5)
+                    e.dispatchThreadgroups(indirectBuffer: gArgs, indirectBufferOffset: 24, threadsPerThreadgroup: t)
+                } else {
+                    dispatch(e, tp.upwarp, Size(guide.width, guide.height - split))
+                }
+            }
         } else if selOut !== midTex {
             cut(selOut === gridFix ? "gridfix" : "select")
             e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(selOut, index: 2); e.setTexture(midTex, index: 3)
@@ -540,6 +669,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         e.setTexture(cA, index: 0); e.setTexture(cB, index: 1); e.setTexture(field, index: 2); e.setTexture(cO, index: 3)
         dispatch(e, psoWarpC, guide)
         }
+        }   // passes
         if Self.hud {
             // After the selection (it read the mean of the previous pairs): fold the newer frame in, ~1 s time constant.
             barrier()
@@ -563,8 +693,8 @@ public final class MotionInterpolator: @unchecked Sendable {
             if let err = cb.error { return completion(nil, err) }
             let bad = Float(counter.contents().load(as: UInt32.self)) / total
             if bad > Self.rejectFraction { return completion(nil, nil) }
-            CVBufferPropagateAttachments(cur, out)
-            completion(out, nil)
+            for o in j.outs { CVBufferPropagateAttachments(cur, o) }
+            completion(j.outs, nil)
         }
         cmd.commit()
         if Self.splat { par = 1 - par; hasPrev = true }
@@ -664,30 +794,55 @@ public final class MotionInterpolator: @unchecked Sendable {
     #define P2_MARGIN 8
     #define P2_SUBPIX 16
     #define P2_HOLE 64
-    // v0.5 Pass 3 (MFG_P3 / per-feature switches, see MOTION.md).
+    // Pass 3 and v0.6 (MFG_P3 / per-feature switches, see MOTION.md).
     constant int kP3 [[function_constant(11)]];
     constant float kSoftS [[function_constant(12)]];        // soft upsample: cost scale (MFG_SOFTS)
-    constant float kLockD [[function_constant(13)]];        // overlay lock: max A/B difference (MFG_LOCKD)
-    constant float kLockC [[function_constant(14)]];        // overlay lock: min local contrast (MFG_LOCKC)
-    constant float kCmT [[function_constant(15)]];          // contrast-adjusted match above this cost (MFG_CMT)
+    constant float kGStroke [[function_constant(13)]];      // subtitle guard: min paired stroke strength (MFG_GSTROKE)
+    constant float kGCenter [[function_constant(14)]];      // subtitle guard: same centre, max |A - B| (MFG_GCENTER)
+    constant float kGShape [[function_constant(15)]];       // subtitle guard: same shape, max |sA - sB| (MFG_GSHAPE)
     constant bool kSoftSide [[function_constant(16)]];      // soft upsample across occlusion cells too (MFG_SOFTSIDE)
-    constant int kP3Dbg [[function_constant(17)]];           // bench: 1 = lock mask white, 2 = soft-blended px white
+    constant int kP3Dbg [[function_constant(17)]];          // bench: 1 = glyph mask white, 2 = soft-blended px white
     constant int kSoftZ [[function_constant(18)]];          // soft upsample fade cost: 0 cell, 1 pixel, 2 mean, 3 max (MFG_SOFTZ)
-    constant bool kSoftK [[function_constant(19)]];          // soft upsample over 3×3 cells, tent 1.5 cells (MFG_SOFTK)
-    constant bool kSoftZS [[function_constant(20)]];         // soft upsample: one vector, cells' fade costs blended (MFG_SOFTZS)
-    constant float kSoftM [[function_constant(21)]];         // soft upsample: vectors this close (guide px) merge (MFG_SOFTM)
-    constant bool kSoftC [[function_constant(22)]];          // soft upsample weights from the 3×3 window only (MFG_SOFTC)
-    constant float kLockG [[function_constant(23)]];         // overlay lock pre-check: max guide A/B difference (MFG_LOCKG)
-    constant float kLockW [[function_constant(24)]];         // overlay lock, weak px (next to a strong lock): max difference (MFG_LOCKW)
-    constant bool kLockSrc [[function_constant(25)]];        // overlay lock: no sample taken from a locked px (MFG_LOCKSRC)
-    constant float kLockB [[function_constant(26)]];         // overlay lock: a stroke at least this bright in the patch (MFG_LOCKB)
-    constant float kLockK [[function_constant(27)]];         // overlay lock: a shadow at most this dark in the patch (MFG_LOCKK)
-    constant float kSoftH [[function_constant(28)]];         // soft upsample: an unchanged pixel (zero vector below this cost) stays hard (MFG_SOFTH)
+    constant bool kSoftK [[function_constant(19)]];         // soft upsample over 3×3 cells, tent 1.5 cells (MFG_SOFTK)
+    constant bool kSoftZS [[function_constant(20)]];        // soft upsample: one vector, cells' fade costs blended (MFG_SOFTZS)
+    constant float kSoftM [[function_constant(21)]];        // soft upsample: vectors this close (guide px) merge (MFG_SOFTM)
+    constant int kSoftC [[function_constant(22)]];          // soft upsample score: 0 upCost (14 taps), 1 sad9, 2 5-tap cross (MFG_SOFTC)
+    constant float kGWorld [[function_constant(23)]];       // subtitle guard: screen patch beats the world patch by this MAE (MFG_GWORLD)
+    constant int kGBins [[function_constant(24)]];          // subtitle guard: seeds in at least this many horizontal bins (MFG_GBINS)
+    constant float kGMove [[function_constant(25)]];        // subtitle guard: local world motion of at least this (native px, MFG_GMOVE)
+    constant float kShE [[function_constant(26)]];          // shadow retry trigger: raw cost (MFG_SHE)
+    constant float kShMD [[function_constant(27)]];         // shadow retry trigger: |mean change| (MFG_SHMD)
+    constant float kSoftH [[function_constant(28)]];        // soft upsample: an unchanged pixel (zero vector below this cost) stays hard (MFG_SOFTH)
+    constant float kShCorr [[function_constant(29)]];       // shadow retry: min correlation (MFG_SHCORR)
+    constant float kShEz [[function_constant(30)]];         // shadow retry: max zero-mean cost (MFG_SHEZ)
+    constant float kShMargin [[function_constant(31)]];     // shadow retry: min margin over the incumbent (MFG_SHMARGIN)
+    constant int kSoftFast [[function_constant(32)]];       // soft upsample cost cuts (MFG_SOFTFAST): 1 early-exit bound, 2 drop low-weight cells
+    constant float kShTex [[function_constant(33)]];        // shadow retry: min texture, min(sqrt(vA), sqrt(vB)) (MFG_SHTEX)
+    constant bool kGOnset [[function_constant(34)]];        // subtitle guard: glyphs in one frame only (onset / disappearing) (MFG_GONSET)
+    constant int kShFB [[function_constant(35)]];           // shadow retry forward-backward check: 0 off, 1 either end, 2 both (MFG_SHFB)
+    constant float kSoftKMin [[function_constant(36)]];     // soft upsample: entries under this weight are dropped (MFG_SOFTKMIN)
+    constant float kGBright [[function_constant(37)]];      // subtitle guard: a seed needs a guide px at least this bright nearby (MFG_GBRIGHT)
+    constant bool kSoftV2 [[function_constant(38)]];        // soft upsample, register-only form with at most kSoftTop warps (MFG_SOFTV2)
+    constant int kSoftTop [[function_constant(39)]];        // soft upsample v2: entries warped per pixel, 1 to 3 (MFG_SOFTTOP)
+    constant float kSoftMR [[function_constant(40)]];       // soft upsample v2: merge radius also this fraction of the vector length (MFG_SOFTMR)
+    constant bool kNoGlyph [[function_constant(41)]];       // mfg_upwarp copy without the subtitle guard (rows out of its reach)
+    constant bool kGFine [[function_constant(42)]];         // subtitle guard anti-copy per luma px instead of per guide px (MFG_GFINE)
+    constant bool kGGrow [[function_constant(43)]];         // steady glyph grow over unchanged px near seed bins (MFG_GGROW)
+    #ifndef SOFTN
+    #define SOFTN 10
+    #endif
+    // Made-frame time t between A (0) and B (1), MFG 4x mode (120 FPS): A is sampled at m + t·d, B at m − (1 − t)·d,
+    // A and B blend (1 − t) : t. kT = 0.5 compiles to exactly the 60 FPS midpoint code. kPairWork: this pass also
+    // updates the per-pair state (static-HUD evidence, bad-match count); the extra 4x passes do not.
+    constant float kT [[function_constant(44)]];
+    constant bool kPairWork [[function_constant(45)]];
+    #define TA (kT)
+    #define TB (1.0 - kT)
+    #define BLT(a, b) (kT == 0.5 ? 0.5 * ((a) + (b)) : mix((a), (b), kT))
     #define P3_SOFT 1
-    #define P3_LOCK 2
+    #define P3_GLYPH 2
     #define P3_EDGE 4
-    #define P3_CMATCH 8
-    #define P3_NEAR 16
+    #define P3_SHADOW 8
     #define P3_HUDPX 32
     inline bool inF(float2 p, float2 s) { return all(p >= 0.0) && all(p <= s); }
     // Both windows (radius r around pa and pb) entirely inside the frame: the per-tap checks can be skipped.
@@ -752,22 +907,26 @@ public final class MotionInterpolator: @unchecked Sendable {
         return s;
     }
 
-    // P3_CMATCH: 5-tap match after a gain / offset fit of A to B (a shadow or light change over the road between
-    // the frames): s = clamp(cov / var, 0.80, 1.25), o = clamp(mean_B - s mean_A, ±0.04). Correspondence only: the
-    // warp never applies s or o.
-    inline float sad5c(texture2d<float, access::sample> a, texture2d<float, access::sample> b, float2 pa, float2 pb) {
-        const float2 o[5] = { float2(0, 0), float2(1.5, 0), float2(-1.5, 0), float2(0, 1.5), float2(0, -1.5) };
-        const float w[5] = { 0.4, 0.15, 0.15, 0.15, 0.15 };
+    // P3_SHADOW: illumination-tolerant statistics of a midpoint vector on a 5-point cross (taps 2 guide px apart),
+    // in float. delta_i = b_i - a_i; x = mean delta, y = Ez = mean |delta_i - mean delta| (the zero-mean cost),
+    // z = corr = cov / sqrt(vA vB + eps), w = min(sqrt(vA), sqrt(vB)) (texture). Correspondence only: the warp never
+    // applies the mean change or a gain to the displayed pixels.
+    inline float4 zmStats(texture2d<float, access::sample> a, texture2d<float, access::sample> b, float2 pa, float2 pb) {
+        const float2 o[5] = { float2(0, 0), float2(2, 0), float2(-2, 0), float2(0, 2), float2(0, -2) };
         float va[5], vb[5], ma = 0, mb = 0;
         for (int i = 0; i < 5; i++) { va[i] = a.sample(lc, pa + o[i]).r; vb[i] = b.sample(lc, pb + o[i]).r; ma += va[i]; mb += vb[i]; }
         ma *= 0.2; mb *= 0.2;
-        float cv = 0, vr = 0;
-        for (int i = 0; i < 5; i++) { cv += (va[i] - ma) * (vb[i] - mb); vr += (va[i] - ma) * (va[i] - ma); }
-        float g = vr > 1e-5 ? clamp(cv / vr, 0.80, 1.25) : 1.0;
-        float off = clamp(mb - g * ma, -0.04, 0.04);
-        float r = 0;
-        for (int i = 0; i < 5; i++) r += w[i] * fabs(g * va[i] + off - vb[i]);
-        return r;
+        float md = mb - ma, ez = 0, cv = 0, sa = 0, sb = 0;
+        for (int i = 0; i < 5; i++) {
+            float da = va[i] - ma, db = vb[i] - mb;
+            ez += fabs(db - da); cv += da * db; sa += da * da; sb += db * db;
+        }
+        return float4(md, 0.2 * ez, cv / sqrt(sa * sb + 1e-8), sqrt(0.2 * min(sa, sb)));
+    }
+
+    // Zero-mean cost of a vector at guide px m (P3_SHADOW pixels in the soft upsample).
+    inline float zmCost(texture2d<float, access::sample> ga, texture2d<float, access::sample> gb, float2 m, float2 d) {
+        return zmStats(ga, gb, m + TA * d, m - TB * d).y;
     }
 
     // A vector whose path (endpoints and quarter points) crosses a static-edge cell carries content through the HUD
@@ -786,7 +945,7 @@ public final class MotionInterpolator: @unchecked Sendable {
     // the warp then samples the in-frame side only.
     inline float candCost(texture2d<float, access::sample> a, texture2d<float, access::sample> b, float2 m, float2 d,
                           int mode, float2 vref) {
-        float2 pa = m + 0.5 * d, pb = m - 0.5 * d;
+        float2 pa = m + TA * d, pb = m - TB * d;
         float2 sz = float2(a.get_width(), a.get_height());
         if (kBorder && !inW(pa, pb, 4.0, sz)) {
             bool ia = inF(pa, sz), ib = inF(pb, sz);
@@ -885,19 +1044,6 @@ public final class MotionInterpolator: @unchecked Sendable {
             if (cost < bestCost) { bestCost = cost; best = d; }
             if ((fl[q] & 1) && cost < ccost) { ccost = cost; cbest = d; }
         }
-        // P3_CMATCH: an ambiguous cell (no good plain match) re-ranks its candidates by the gain / offset-fitted match;
-        // the cost kept is the plain one of the vector chosen (the fade to the blend stays honest).
-        if ((kP3 & P3_CMATCH) && bestCost > kCmT) {
-            float cb2 = 1e9; int qb = -1;
-            for (int q = 0; q < n; q++) {
-                float2 d = float2(seen[q]);
-                float2 pa = m + 0.5 * d, pb = m - 0.5 * d;
-                if (!inW(pa, pb, 3.0, float2(ga.get_width(), ga.get_height()))) continue;
-                float c = sad5c(ga, gb, pa, pb) + CROSS(d) - (q == 0 ? 0.004 : 0.0);
-                if (c < cb2) { cb2 = c; qb = q; }
-            }
-            if (qb >= 0) { best = float2(seen[qb]); bestCost = float(sc[qb]); }
-        }
         // A consistent splat that matches well enough is the occupancy at the midpoint: it wins over a cheaper vector
         // that pairs two unrelated look-alike areas (dark road under the player's car).
         float preBest = bestCost;
@@ -939,7 +1085,7 @@ public final class MotionInterpolator: @unchecked Sendable {
                 hn.x = clamp(h.x + (st ? 1.0 / 16.0 : -0.25), 0.0, 1.0);
                 hn.y = hn.x >= 0.75 ? 1.0 : (hn.x < 0.35 ? 0.0 : h.y);
             }
-            hudN[hi] = hn;
+            if (kPairWork) hudN[hi] = hn;
             if (h.y > 0.5 && !(preBest < 0.03 && zc > preBest + 0.03)) {
                 masked = true; best = float2(0); bestCost = zc;
             }
@@ -964,7 +1110,7 @@ public final class MotionInterpolator: @unchecked Sendable {
             side = 1;
             bool proven = false;
             if (altCost < 1e8) {
-                float2 qa = m + 0.5 * g, rb = m - 0.5 * g;
+                float2 qa = m + TA * g, rb = m - TB * g;
                 float eA = SAD(qa, qa - f);              // A's sample moved with f: foreground there, use B
                 float eB = SAD(rb + f, rb);              // B's sample moved with f: foreground there, use A
                 side = eA < eB ? 2 : 1;
@@ -975,7 +1121,7 @@ public final class MotionInterpolator: @unchecked Sendable {
             // motion then pastes unrelated content (a dark shadow block on fast road); keep the cheapest two-sided
             // match instead, and let the low-confidence fade decide.
             if ((kP2 & P2_OCC) && !proven) { best = cheap; side = 0; }
-            atomic_fetch_add_explicit(bad, 1u, memory_order_relaxed);
+            if (kPairWork) atomic_fetch_add_explicit(bad, 1u, memory_order_relaxed);
         }
         // P3_HUDPX: a cell left on the zero vector (static HUD, or moving vectors penalised for crossing it) offers
         // its best moving vector; each pixel then decides by its own match (the road between subtitle lines moves).
@@ -989,8 +1135,15 @@ public final class MotionInterpolator: @unchecked Sendable {
     // Midpoint grid, 1-ring pull (P2_HOLE): a cell whose match is poor (a hole in the splat, a wrong block vector on
     // fast road) tries the vectors its 8 neighbours chose. It takes the best one that clearly improves its own cost;
     // a pull that matches well also clears an occlusion side. Static-HUD cells keep their zero vector.
+    // P3_SHADOW first: a two-sided cell with a poor raw match where the neighbourhood carries a distinct road vector
+    // (a shadow or light sweeping over the road changes the brightness between the frames, so the raw match prefers a
+    // vector that follows the shadow) scores 2 candidates, the incumbent and that road vector, by the zero-mean cost.
+    // An admitted cell gets side 4: both original endpoints warped and blended with the road vector, no fade to the
+    // plain blend, and no 8-px stamp in the upsample. Its .z keeps the raw cost (the zero-mean score never enters the
+    // raw-cost fields).
     kernel void mfg_gridfix(texture2d<float, access::sample> ga [[texture(0)]], texture2d<float, access::sample> gb [[texture(1)]],
                             texture2d<half, access::read> gi [[texture(2)]], texture2d<half, access::write> go [[texture(3)]],
+                            texture2d<half, access::read> fa [[texture(4)]], texture2d<half, access::read> fbf [[texture(5)]],
                             constant float &G [[buffer(0)]], device const float2 *hudP [[buffer(1)]], constant int &hudOn [[buffer(2)]],
                             constant float2 &thr [[buffer(3)]], uint2 id [[thread_position_in_grid]]) {
         int2 hi = int2(gi.get_width() - 1, gi.get_height() - 1);
@@ -999,8 +1152,46 @@ public final class MotionInterpolator: @unchecked Sendable {
         float c0 = float(c.z);
         int2 gs = hi + 1;
         bool masked = hudOn != 0 && hudP[id.y * uint(gs.x) + id.x].y > 0.5;
-        if (masked || c0 <= thr.x) { go.write(c, id); return; }
         float2 m = (float2(id) + 0.5) * G, own = float2(c.xy);
+        if ((kP3 & P3_SHADOW) && !masked && c.w == 0 && c0 >= kShE) {
+            // The locally supported road vector: the neighbours' vector that most of the 8 share (within 1 px), at
+            // least 3 of them, moving, and distinct from the incumbent.
+            float2 nv[8];
+            for (int k = 0, t = 0; k < 9; k++) {
+                if (k == 4) continue;
+                nv[t++] = float2(gi.read(uint2(clamp(int2(id) + int2(k % 3 - 1, k / 3 - 1), int2(0), hi))).xy);
+            }
+            int bs = 0; float2 alt = own;
+            for (int k = 0; k < 8; k++) {
+                if (distance(nv[k], own) <= 1.0 || length(nv[k]) < 1.0) continue;
+                int sup = 0;
+                for (int q = 0; q < 8; q++) sup += distance(nv[q], nv[k]) <= 1.0 ? 1 : 0;
+                if (sup > bs) { bs = sup; alt = nv[k]; }
+            }
+            float2 gsz = float2(ga.get_width(), ga.get_height());
+            float2 qa = m + TA * alt, qb = m - TB * alt;
+            if (bs >= 3 && inW(qa, qb, 3.0, gsz) && inW(m + TA * own, m - TB * own, 3.0, gsz)) {
+                float4 si = zmStats(ga, gb, m + TA * own, m - TB * own), sa = zmStats(ga, gb, qa, qb);
+                bool flagged = max(fabs(si.x), fabs(sa.x)) >= kShMD && sa.w >= kShTex;
+                bool admit = flagged && sa.z >= kShCorr && sa.y <= kShEz && si.y - sa.y >= kShMargin;
+                if (admit && kShFB > 0) {
+                    // Forward-backward: the anchored fields at the two endpoints send the road vector back
+                    // (A side: F_A(x) ≈ -d, B side: F_B(x) ≈ d), within 1 px + 5 %.
+                    float tol = 1.0 + 0.05 * length(alt);
+                    int2 fh = int2(fa.get_width() - 1, fa.get_height() - 1);
+                    bool okA = distance(float2(fa.read(uint2(clamp(int2(qa / G), int2(0), fh))).xy), -alt) < tol;
+                    bool okB = distance(float2(fbf.read(uint2(clamp(int2(qb / G), int2(0), fh))).xy), alt) < tol;
+                    admit = kShFB == 2 ? (okA && okB) : (okA || okB);
+                }
+                if (kP3Dbg == 11 && flagged) admit = false;
+                if (admit) {
+                    float raw = candCost(ga, gb, m, alt, kSad, alt);
+                    go.write(half4(half2(alt), half(raw), 4), id);
+                    return;
+                }
+            }
+        }
+        if (!(kP2 & P2_HOLE) || masked || c0 <= thr.x) { go.write(c, id); return; }
         float2 tried[8]; int nt = 0;
         float bc = c0, bt = min(c0 - 0.002, c0 * 0.85); float2 best = own; bool hit = false;
         for (int k = 0; k < 9; k++) {
@@ -1174,7 +1365,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         half4 c = F.read(id);
         if (float(c.z) > P.w) return;
         float2 v = float2(c.xy);
-        float2 t = ((float2(id) + 0.5) * G + 0.5 * v) / G;              // target cell
+        float2 t = ((float2(id) + 0.5) * G + (P.z < 0 ? TA : TB) * v) / G;   // A side (P.z < 0) moves t of its way, B side 1 - t              // target cell
         if (any(t < 0.0) || t.x >= float(W) || t.y >= float(H)) return;
         float2 d = P.z * v;
         int2 o = int2(floor(((float2(id) + 0.5) * G + v) / G));
@@ -1192,7 +1383,7 @@ public final class MotionInterpolator: @unchecked Sendable {
     // same order as the two windows on their own. Exits early (returning a value ≥ bound) once the sad9 part alone
     // cannot get under `bound`: every term is non-negative, so the partial sum is a lower bound of the full cost.
     inline float upCost(texture2d<float, access::sample> ga, texture2d<float, access::sample> gb, float2 m, float2 d, float bound) {
-        float2 pa = m + 0.5 * d, pb = m - 0.5 * d;
+        float2 pa = m + TA * d, pb = m - TB * d;
         float c0 = fabs(ga.sample(lc, pa).r - gb.sample(lc, pb).r);
         float s9 = 0;
         for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
@@ -1235,24 +1426,26 @@ public final class MotionInterpolator: @unchecked Sendable {
             if (ws > 0) zb = zs / ws;
         }
         if (same) return (kP2 & P2_UPZ) && near.w == 0 ? half4(near.xy, half(zb), near.w) : near;
-        if (near.w != 0 && !(kP2 & P2_UPSIDE)) return near;
+        // Side 4 (P3_SHADOW): a two-sided cell scored by the zero-mean cost, never stamped as a one-sided tile.
+        bool nOne = near.w != 0 && near.w != 4;
+        if (nOne && !(kP2 & P2_UPSIDE)) return near;
         float2 gsz = float2(ga.get_width(), ga.get_height());
         // Score of candidate t; the lowest score wins, ties go to the lowest index (the original loop order).
         int bi = -1; float bc = 1e9;
         for (int r = 0; r < 4; r++) {
             int t = r == 0 ? ni : (r <= ni ? r - 1 : r);             // nearest first, then the others in order
-            if (v[t].w != 0) continue;
+            if (v[t].w != 0 && v[t].w != 4) continue;
             bool dup = false;                                        // an identical vector at a lower index scores the same
-            for (int s = 0; s < t; s++) if (v[s].w == 0 && all(v[s].xy == v[t].xy)) { dup = true; break; }
+            for (int s = 0; s < t; s++) if (v[s].w == v[t].w && all(v[s].xy == v[t].xy)) { dup = true; break; }
             if (dup) continue;
             float2 d = float2(v[t].xy);
             bool z = all(fabs(d) < 0.25);
             float c;
-            if (kBorder && !(inF(m + 0.5 * d, gsz) && inF(m - 0.5 * d, gsz))) c = 0.04 + 0.002 * distance(d, float2(near.xy));   // one-sided: keep the nearest cell's choice
+            if (kBorder && !(inF(m + TA * d, gsz) && inF(m - TB * d, gsz))) c = 0.04 + 0.002 * distance(d, float2(near.xy));   // one-sided: keep the nearest cell's choice
             else {
                 // Exit bound with a small margin: only a partial sum that is surely worse than the best so far exits.
                 float bnd = bi < 0 ? 1e9 : bc + (z ? 0.004 : 0.0) + 1e-5;
-                c = upCost(ga, gb, m, d, bnd);
+                c = v[t].w == 4 ? zmCost(ga, gb, m, d) : upCost(ga, gb, m, d, bnd);
             }
             if (z) c -= 0.004;
             if (c < bc || (c == bc && t < bi)) { bc = c; bi = t; }
@@ -1270,12 +1463,12 @@ public final class MotionInterpolator: @unchecked Sendable {
             }
             if (ws > 0) {
                 float2 d = vs / ws;
-                if (inF(m + 0.5 * d, gsz) && inF(m - 0.5 * d, gsz)) {
+                if (inF(m + TA * d, gsz) && inF(m - TB * d, gsz)) {
                     float c = upCost(ga, gb, m, d, bi < 0 ? 1e9 : bc - 1e-4);
                     if (c < bc - 1e-4) { bc = c; r = half4(half2(d), 0, 0); bi = 4; }
                 }
             }
-            if (near.w != 0) {
+            if (nOne) {
                 if (bi < 0 || bc > 0.06) return near;            // nothing two-sided fits: keep the occlusion side
                 return half4(r.xy, half(bc), 0);
             }
@@ -1314,7 +1507,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         float2 med = v[bi];
         if (all(fabs(med - v[4]) < 0.25)) { outv.write(c, id); return; }
         float2 m = float2(id) + 0.5;
-        float cost = sad5(ga, gb, m + 0.5 * med, m - 0.5 * med);
+        float cost = sad5(ga, gb, m + TA * med, m - TB * med);
         if (cost <= float(c.z) + 0.006) outv.write(half4(half2(med), half(cost), 0), id);
         else outv.write(c, id);
     }
@@ -1331,7 +1524,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         if (c.w != 0) { outv.write(c, id); return; }
         float2 m = float2(id) + 0.5, own = float2(c.xy), best = own;
         #define SADR(pa, pb) (opt.y == 2 ? sad25(ga, gb, pa, pb) : opt.y != 0 ? sad9(ga, gb, pa, pb) : sad5(ga, gb, pa, pb))
-        float bc = SADR(m + 0.5 * own, m - 0.5 * own);
+        float bc = SADR(m + TA * own, m - TB * own);
         if (all(fabs(own) < 0.25)) bc -= 0.004;                         // keep the static-HUD bias
         float2 cand[12]; int n = 0;
         for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
@@ -1342,7 +1535,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         for (int k = 0; k < n; k++) {
             float2 d = cand[k];
             if (all(fabs(d - own) < 0.25)) continue;
-            float cost = SADR(m + 0.5 * d, m - 0.5 * d) + lam * min(distance(d, own), 12.0);
+            float cost = SADR(m + TA * d, m - TB * d) + lam * min(distance(d, own), 12.0);
             if (all(fabs(d) < 0.25)) cost -= 0.004;
             if (cost < bc) { bc = cost; best = d; }
         }
@@ -1366,42 +1559,57 @@ public final class MotionInterpolator: @unchecked Sendable {
 
     // Warp of one luma pixel (full res; v in guide px, ×2 here) / one CbCr texel (guide res) with field value v.
     // Warp before the low-confidence fade; f = the fade amount (toward the plain blend at the pixel).
-    inline float warpY0(texture2d<float, access::sample> ya, texture2d<float, access::sample> yb, float4 v, uint2 id, float2 s, float2 fb, thread float &f) {
+    // rej (subtitle guard, anti-copy): bit 1 = the A sample lands on a glyph of A, bit 2 = the B sample on a glyph of
+    // B; a rejected side is dropped and the other valid world sample taken (neither: A at the pixel).
+    // Side 4 (P3_SHADOW, admitted shadow cell): both endpoints, no fade.
+    inline float warpY0(texture2d<float, access::sample> ya, texture2d<float, access::sample> yb, float4 v, uint2 id, float2 s, float2 fb, thread float &f, uint rej) {
         float2 p = float2(id) + 0.5, d = v.xy * 2.0;
-        float2 pa = p + 0.5 * d, pb = p - 0.5 * d;
-        bool okA = inside(pa, s), okB = inside(pb, s);
+        float2 pa = p + TA * d, pb = p - TB * d;
+        bool okA = inside(pa, s) && !(rej & 1), okB = inside(pb, s) && !(rej & 2);
         float a = ya.sample(lc, pa).r, b = yb.sample(lc, pb).r;
-        float o = (v.w == 1 || !okB) && okA ? a : ((v.w == 2 || !okA) && okB ? b : (okA && okB ? 0.5 * (a + b) : ya.sample(lc, p).r));
+        float o = (v.w == 1 || !okB) && okA ? a : ((v.w == 2 || !okA) && okB ? b : (okA && okB ? BLT(a, b) :
+                  rej ? BLT(ya.sample(lc, p).r, yb.sample(lc, p).r) : ya.sample(lc, p).r));   // both glyph-rejected: the plain blend
         if ((kP3 & P3_EDGE) && v.w == 0 && !inW(pa, pb, 8.0, s)) {   // the side leaving the frame fades out over 8 px
-            float wa = edgeW(pa, s, 8.0), wb = edgeW(pb, s, 8.0);
+            float wa = okA ? edgeW(pa, s, 8.0) : 0.0, wb = okB ? edgeW(pb, s, 8.0) : 0.0;
+            if (kT != 0.5) { wa *= TB; wb *= TA; }
             if (wa + wb > 0) o = (wa * a + wb * b) / (wa + wb);
         }
         f = v.w == 0 && (!kBorder || (okA && okB) || (kP3 & P3_EDGE)) ? smoothstep(fb.x, fb.y, v.z) : 0.0;
+        if (kP3Dbg == 4) { f = 0; return (rej & 1) ? 1.0 : (rej & 2) ? 0.6 : 0.0; }
         return o;
     }
-    inline float warpY(texture2d<float, access::sample> ya, texture2d<float, access::sample> yb, float4 v, uint2 id, float2 s, float2 fb) {
-        float k; float o = warpY0(ya, yb, v, id, s, fb, k);
+    // The plain blend at the pixel (the low-confidence fade target); A alone at a glyph onset (B's glyph stays out).
+    inline float plainY(texture2d<float, access::sample> ya, texture2d<float, access::sample> yb, uint2 id, bool onset) {
         float2 p = float2(id) + 0.5;
-        if (k > 0) o = mix(o, 0.5 * (ya.sample(lc, p).r + yb.sample(lc, p).r), k);
+        return onset ? ya.sample(lc, p).r : BLT(ya.sample(lc, p).r, yb.sample(lc, p).r);
+    }
+    inline float warpY(texture2d<float, access::sample> ya, texture2d<float, access::sample> yb, float4 v, uint2 id, float2 s, float2 fb, uint rej, bool onset) {
+        float k; float o = warpY0(ya, yb, v, id, s, fb, k, rej);
+        if (k > 0) o = mix(o, plainY(ya, yb, id, onset), k);
         return o;
     }
-    inline float2 warpC0(texture2d<float, access::sample> ca, texture2d<float, access::sample> cb, float4 v, uint2 id, float2 s, float2 fb, thread float &f) {
+    inline float2 warpC0(texture2d<float, access::sample> ca, texture2d<float, access::sample> cb, float4 v, uint2 id, float2 s, float2 fb, thread float &f, uint rej) {
         float2 p = float2(id) + 0.5, d = v.xy;
-        float2 pa = p + 0.5 * d, pb = p - 0.5 * d;
-        bool okA = inside(pa, s), okB = inside(pb, s);
+        float2 pa = p + TA * d, pb = p - TB * d;
+        bool okA = inside(pa, s) && !(rej & 1), okB = inside(pb, s) && !(rej & 2);
         float2 a = ca.sample(lc, pa).rg, b = cb.sample(lc, pb).rg;
-        float2 o = (v.w == 1 || !okB) && okA ? a : ((v.w == 2 || !okA) && okB ? b : (okA && okB ? 0.5 * (a + b) : ca.sample(lc, p).rg));
+        float2 o = (v.w == 1 || !okB) && okA ? a : ((v.w == 2 || !okA) && okB ? b : (okA && okB ? BLT(a, b) :
+                   rej ? BLT(ca.sample(lc, p).rg, cb.sample(lc, p).rg) : ca.sample(lc, p).rg));
         if ((kP3 & P3_EDGE) && v.w == 0 && !inW(pa, pb, 4.0, s)) {
-            float wa = edgeW(pa, s, 4.0), wb = edgeW(pb, s, 4.0);
+            float wa = okA ? edgeW(pa, s, 4.0) : 0.0, wb = okB ? edgeW(pb, s, 4.0) : 0.0;
+            if (kT != 0.5) { wa *= TB; wb *= TA; }
             if (wa + wb > 0) o = (wa * a + wb * b) / (wa + wb);
         }
         f = v.w == 0 && (!kBorder || (okA && okB) || (kP3 & P3_EDGE)) ? smoothstep(fb.x, fb.y, v.z) : 0.0;
         return o;
     }
-    inline float2 warpC(texture2d<float, access::sample> ca, texture2d<float, access::sample> cb, float4 v, uint2 id, float2 s, float2 fb) {
-        float k; float2 o = warpC0(ca, cb, v, id, s, fb, k);
+    inline float2 plainC(texture2d<float, access::sample> ca, texture2d<float, access::sample> cb, uint2 id, bool onset) {
         float2 p = float2(id) + 0.5;
-        if (k > 0) o = mix(o, 0.5 * (ca.sample(lc, p).rg + cb.sample(lc, p).rg), k);
+        return onset ? ca.sample(lc, p).rg : BLT(ca.sample(lc, p).rg, cb.sample(lc, p).rg);
+    }
+    inline float2 warpC(texture2d<float, access::sample> ca, texture2d<float, access::sample> cb, float4 v, uint2 id, float2 s, float2 fb, uint rej, bool onset) {
+        float k; float2 o = warpC0(ca, cb, v, id, s, fb, k, rej);
+        if (k > 0) o = mix(o, plainC(ca, cb, id, onset), k);
         return o;
     }
 
@@ -1417,7 +1625,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         if (dbg == 5) { float4 v = float4(mid.read(id / 4)); yo.write(float4(0.06 + min(length(v.xy) / 30.0, 0.9)), id); return; }
         if (id.x >= uint(s.x) || id.y >= uint(s.y)) return;
         float4 v = float4(mid.read(min(id / 2, uint2(mid.get_width() - 1, mid.get_height() - 1))));
-        yo.write(float4(warpY(ya, yb, v, id, s, fb)), id);
+        yo.write(float4(warpY(ya, yb, v, id, s, fb, 0, false)), id);
     }
 
     // Chroma plane is at guide resolution: vectors apply as-is.
@@ -1426,151 +1634,372 @@ public final class MotionInterpolator: @unchecked Sendable {
                            constant float2 &fb [[buffer(1)]], uint2 id [[thread_position_in_grid]]) {
         float2 s = float2(co.get_width(), co.get_height());
         if (id.x >= uint(s.x) || id.y >= uint(s.y)) return;
-        co.write(float4(warpC(ca, cb, float4(mid.read(id)), id, s, fb), 0, 1), id);
+        co.write(float4(warpC(ca, cb, float4(mid.read(id)), id, s, fb, 0, false), 0, 1), id);
     }
 
-    // Static overlay (P3_LOCK), per full-res luma px: the same in both frames (centre, and at least 4 of its 3×3) and
-    // a strong local contrast (5×5 range): subtitle and HUD text strokes with their drop shadow, also when the learned
-    // HUD mask has not seen them (subtitles come and go). Fast blurred road does not match itself with that contrast.
-    // One thread per guide px: its 2×2 luma px as 4 bits in Lg (bit (y & 1) * 2 + (x & 1)).
-    kernel void mfg_lock(texture2d<float, access::read> ya [[texture(0)]], texture2d<float, access::read> yb [[texture(1)]],
-                         texture2d<float, access::write> Lg [[texture(2)]],
-                         texture2d<float, access::read> ga [[texture(4)]], texture2d<float, access::read> gb [[texture(5)]],
-                         uint2 id [[thread_position_in_grid]]) {
-        if (id.x >= Lg.get_width() || id.y >= Lg.get_height()) return;
-        uint bits = 0;
-        // Cheap pre-check on the half-res guides: some contrast around, and the pixel itself unchanged.
+    // Subtitle guard (P3_GLYPH, v0.6), pair-local: subtitle / pop-up text inside the configured band (rows band.x to
+    // band.y of the guide), found in this pair alone (separate from the learned static-HUD mask), on normalized luma.
+    // Stroke test: on the H and V axes at radii 1 and 2 px, dl = I(p) - I(p - r axis), dr = I(p) - I(p + r axis); with
+    // the same nonzero sign, strength = sign(dl) min(|dl|, |dr|) (the strongest of the four).
+    inline float strokeS(texture2d<float, access::sample> t, float2 p) {
+        float c = t.sample(lc, p).r, best = 0;
+        for (int ax = 0; ax < 2; ax++) for (int r = 1; r <= 2; r++) {
+            float2 o = ax == 0 ? float2(r, 0) : float2(0, r);
+            float dl = 1.1644 * (c - t.sample(lc, p - o).r), dr = 1.1644 * (c - t.sample(lc, p + o).r);
+            if (dl * dr > 0) { float st = sign(dl) * min(fabs(dl), fabs(dr)); if (fabs(st) > fabs(best)) best = st; }
+        }
+        return best;
+    }
+    // Seeds, one thread per guide px of the band (its 2×2 luma px). Bits per luma px q: q = glyph in A, 4 + q = glyph
+    // in B, 8 + q = the same glyph in both (steady: shown as the blend of A and B at the same screen position).
+    //   Steady: paired strokes (same sign, both at least kGStroke), same centre (|A - B| <= kGCenter), same shape
+    //   (|sA - sB| <= kGShape), and the screen-space patch beats the world-displaced patch by kGWorld (MAE).
+    //   Otherwise (kGOnset: a glyph appearing, fading or leaving): a stroke of one frame that the world motion does
+    //   not bring from the other frame (no same-sign stroke there) and whose patch it does not explain (MAE over
+    //   kGWorld) is a glyph of that frame.
+    // The world motion is the largest VideoToolbox vector of the 3×3 blocks around (B(p) ≈ A(p + v)); under kGMove
+    // native px nothing is seeded (a still picture needs no guard).
+    kernel void mfg_gseed(texture2d<float, access::sample> ya [[texture(0)]], texture2d<float, access::sample> yb [[texture(1)]],
+                          texture2d<float, access::read> vb [[texture(2)]], texture2d<uint, access::write> S [[texture(3)]],
+                          texture2d<float, access::read> ga [[texture(4)]], texture2d<float, access::read> gb [[texture(5)]],
+                          device atomic_uint *bins [[buffer(0)]], constant int2 &band [[buffer(1)]], constant float2 &blk [[buffer(2)]],
+                          uint2 tid [[thread_position_in_grid]]) {
+        uint2 id = uint2(tid.x, tid.y + uint(band.x));
+        if (id.x >= S.get_width() || int(id.y) >= band.y) return;
         int2 gh = int2(ga.get_width() - 1, ga.get_height() - 1);
-        float glo = 1, ghi = 0;
-        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {      // either frame (as the full-res check)
+        float lo = 1, hv = 0;
+        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
             uint2 g = uint2(clamp(int2(id) + int2(i, j), int2(0), gh));
             float r = ga.read(g).r, r2 = gb.read(g).r;
-            glo = min(glo, min(r, r2)); ghi = max(ghi, max(r, r2));
+            lo = min(lo, min(r, r2)); hv = max(hv, max(r, r2));
         }
-        if (ghi - glo < 0.5 * kLockC || ghi < 0.6 * kLockB || fabs(ga.read(id).r - gb.read(id).r) > kLockG) {
-            Lg.write(float4(kP3Dbg == 9 ? 64.0 / 255.0 : 0.0), id);
-            return;
+        // Flat, or nothing bright (overlay text is bright over a dark shadow): no glyph here. Most band px stop here.
+        if (hv - lo < kGStroke || hv < kGBright) { S.write(uint4(0), id); return; }
+        int2 cells = int2(vb.get_width(), vb.get_height());
+        int2 c0 = int2((float2(id) + 0.5) / blk);
+        // Strokes first (most band px have none), then the world motion only where needed.
+        float sA[4], sB[4]; bool anyS = false;
+        for (uint q = 0; q < 4; q++) {
+            float2 p = float2(id * 2 + uint2(q & 1, q >> 1)) + 0.5;
+            sA[q] = strokeS(ya, p); sB[q] = strokeS(yb, p);
+            anyS = anyS || max(fabs(sA[q]), fabs(sB[q])) >= kGStroke;
         }
-        // Full res: the 2×2 px share one 4×4 patch of each frame (3×3 differences and the contrast), read once.
-        int2 hi = int2(ya.get_width() - 1, ya.get_height() - 1), o = int2(id) * 2;
-        float D[16], lo = 1, hv = 0;
-        for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {
-            uint2 p = uint2(clamp(o + int2(i - 1, j - 1), int2(0), hi));
-            float a = ya.read(p).r, bb = yb.read(p).r;
-            D[j * 4 + i] = fabs(a - bb);
-            lo = min(lo, min(a, bb)); hv = max(hv, max(a, bb));
+        if (!anyS) { S.write(uint4(0), id); return; }
+        // World motion: the vector that best explains the 4×4 luma patch (B(p) ≈ A(p + dw)) among the 3×3 VideoToolbox
+        // blocks around, refined by ±0.5 px. A vector that merely exists nearby is not enough: grain and texture then
+        // look "unexplained" and seed everywhere.
+        float2 dw = 0; float wB = 1e9;
+        // Only moving candidates (at least kGMove): a glyph patch itself matches best on the zero vector.
+        float2 tried[9]; int nt = 0;
+        for (int k = 0; k < 13; k++) {
+            float2 d;
+            if (k < 9) {
+                d = 2.0 * vb.read(uint2(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0), cells - 1))).rg;
+                if (length(d) < kGMove) continue;
+                bool dup = false;
+                for (int t = 0; t < nt; t++) dup = dup || all(fabs(tried[t] - d) < 0.25);
+                if (dup) continue;
+                tried[nt++] = d;
+            } else {
+                const float2 o4[4] = { float2(0.5, 0), float2(-0.5, 0), float2(0, 0.5), float2(0, -0.5) };
+                d = dw + o4[k - 9];
+            }
+            float e = 0;
+            for (int j = -1; j <= 2; j++) for (int i = -1; i <= 2; i++) {
+                float2 p = float2(int2(id * 2) + int2(i, j)) + 0.5;
+                e += fabs(yb.sample(lc, p).r - ya.sample(lc, p + d).r);
+            }
+            if (e < wB) { wB = e; dw = d; }
+            if (k == 8 && nt == 0) break;
         }
-        // Full-res contrast over the 4×4 patch of either frame (a white stroke over a bright road in one frame still
-        // stands out against the darker road of the other).
-        // Overlay text is a bright stroke with a dark drop shadow (subtitles, HUD labels): both in the patch, not
-        // just any contrast (the player's car, wires against the sky keep their place on screen too, and are better
-        // warped).
-        if (hv - lo < kLockC || hv < kLockB || lo > kLockK) { Lg.write(float4(kP3Dbg == 9 ? 128.0 / 255.0 : 0.0), id); return; }
-        for (int q = 0; q < 4; q++) {
-            int qx = q & 1, qy = q >> 1;
-            int same = 0;
-            for (int j = 0; j <= 2; j++) for (int i = 0; i <= 2; i++) same += D[(qy + j) * 4 + qx + i] < 1.5 * kLockD ? 1 : 0;
-            // The stroke and the pixels next to it agree; the soft edge of the drop shadow over the road may not.
-            float dq = D[(qy + 1) * 4 + qx + 1];
-            if (dq < kLockD && same >= 4) bits |= 1u << q;
-            else if (dq < kLockW) bits |= 16u << q;            // weak: locked only next to a strong lock (mfg_lockdil)
+        if (nt == 0) { S.write(uint4(0), id); return; }              // a still picture here needs no guard
+        uint st = 0, onA = 0, onB = 0;
+        for (uint q = 0; q < 4; q++) {
+            float2 p = float2(id * 2 + uint2(q & 1, q >> 1)) + 0.5;
+            bool paired = sA[q] * sB[q] > 0 && min(fabs(sA[q]), fabs(sB[q])) >= kGStroke;
+            if (paired && 1.1644 * fabs(ya.sample(lc, p).r - yb.sample(lc, p).r) <= kGCenter && fabs(sA[q] - sB[q]) <= kGShape) st |= 1u << q;
+            else if (kGOnset) {
+                // One frame only: a strong bright stroke (overlay text is bright over a dark shadow); weak or dark
+                // strokes are road grain far more often than a glyph appearing.
+                float h = 0.5 * kGStroke, ks = 3.0 * kGStroke;
+                float la = 1.1644 * (ya.sample(lc, p).r - 0.0627), lb = 1.1644 * (yb.sample(lc, p).r - 0.0627);
+                sB[q] = lb >= 0.5 ? sB[q] : 0.0; sA[q] = la >= 0.5 ? sA[q] : 0.0;
+                if (sB[q] >= ks) {
+                    float sw = strokeS(ya, p + dw);                  // A's content that the world motion brings here
+                    if (!(sw * sB[q] > 0 && fabs(sw) >= h)) onB |= 1u << q;
+                }
+                if (sA[q] >= ks) {
+                    float sw = strokeS(yb, p - dw);
+                    if (!(sw * sA[q] > 0 && fabs(sw) >= h)) onA |= 1u << q;
+                }
+            }
         }
-        Lg.write(float4(float(bits) / 255.0), id);
-    }
-    // Lg dilated over the 4×4 px around each px (the 2×2 a bilinear tap reads, and one more px for the
-    // anti-aliased rim of a stroke, which may not lock itself): one read per source check.
-    // Also the final per-px bits (Lb): the strong ones, and the weak ones (a semi-transparent stroke that differs a
-    // little between frames) within 3 guide px of a strong lock, so a stroke is not locked in dashes.
-    kernel void mfg_lockdil(texture2d<half, access::read> Lg [[texture(0)]], texture2d<float, access::write> Ld [[texture(1)]],
-                            texture2d<float, access::write> Lb [[texture(2)]], uint2 id [[thread_position_in_grid]]) {
-        int2 hi = int2(Lg.get_width() - 1, Lg.get_height() - 1);
-        if (int(id.x) > hi.x || int(id.y) > hi.y) return;
-        uint own = uint(round(float(Lg.read(id).r) * 255.0)), strong = 0;
-        if ((own >> 4) != 0)                                  // a strong lock within 3 px (guide) along the stroke
-            for (int j = -3; j <= 3; j++) for (int i = -3; i <= 3; i++)
-                strong |= uint(round(float(Lg.read(uint2(clamp(int2(id) + int2(i, j), int2(0), hi))).r) * 255.0)) & 15u;
-        uint fin = (own & 15u) | (strong != 0 ? (own >> 4) : 0u);
-        bool on = false;
-        for (int j = -1; j <= 2; j++) for (int i = -1; i <= 2; i++) on = on || (uint(round(float(Lg.read(uint2(clamp(int2(id) + int2(i, j), int2(0), hi))).r) * 255.0)) & 15u) != 0;
-        Ld.write(float4(on || fin != 0 ? 1.0 : 0.0), id);
-        Lb.write(float4(float(fin) / 255.0), id);
-    }
-    inline bool locked(texture2d<half, access::read> Ld, float2 p) {
-        int2 hi = int2(Ld.get_width() - 1, Ld.get_height() - 1);
-        return Ld.read(uint2(clamp(int2(floor(p - 0.5)), int2(0), hi))).r > 0.5;
-    }
-    // A moving pixel may not take its sample from a locked overlay pixel (text copied onto the road): that side is
-    // dropped; both sides locked = the plain blend at the pixel.
-    inline float4 lockFix(texture2d<half, access::read> L, float2 m, float4 v) {
-        if (all(fabs(v.xy) < 0.25)) return v;
-        bool la = locked(L, m + 0.5 * v.xy), lb = locked(L, m - 0.5 * v.xy);
-        if (!la && !lb) return v;
-        float2 sz = float2(L.get_width(), L.get_height());
-        bool oa = inF(m + 0.5 * v.xy, sz), ob = inF(m - 0.5 * v.xy, sz);  // the side left must be inside the frame
-        if ((la && lb) || (la && v.w == 1) || (lb && v.w == 2)) return float4(0, 0, 0, 0);
-        // The side left is outside the frame (fast motion at the edge): its sample is pulled back to the edge (a
-        // streak of the edge row, as the motion blur there looks), not the plain blend of two unrelated pixels.
-        if (la && !ob) { float2 pb = clamp(m - 0.5 * v.xy, float2(0.5), sz - 0.5); return float4(2.0 * (m - pb), v.z, 2.0); }
-        if (lb && !oa) { float2 pa = clamp(m + 0.5 * v.xy, float2(0.5), sz - 0.5); return float4(2.0 * (pa - m), v.z, 1.0); }
-        return float4(v.xyz, la ? 2.0 : 1.0);
+        if ((st | onA | onB) != 0) {
+            // Patch check over the 4×4 luma px: screen-space |A - B| against the best world explanation.
+            float scr = 0, wA = 0;
+            for (int j = -1; j <= 2; j++) for (int i = -1; i <= 2; i++) {
+                float2 p = float2(int2(id * 2) + int2(i, j)) + 0.5;
+                float a = ya.sample(lc, p).r;
+                scr += fabs(a - yb.sample(lc, p).r); wA += fabs(a - yb.sample(lc, p - dw).r);
+            }
+            scr *= 1.1644 / 16.0; wA *= 1.1644 / 16.0; float wBn = wB * 1.1644 / 16.0;
+            // The screen-space patch must itself match (a glyph and its shadow stay put): fast grain or texture
+            // matches neither way and must not pass as "unexplained by the world".
+            if (min(wA, wBn) < scr + kGWorld || scr > 2.5 * kGCenter) st = 0;
+            if (wBn < kGWorld) onB = 0;
+            if (wA < kGWorld) onA = 0;
+        }
+        uint bits = (st | onA) | ((st | onB) << 4) | (st << 8);
+        S.write(uint4(bits), id);
+        if (bits != 0) {
+            uint bw = (S.get_width() + 7) / 8;
+            atomic_store_explicit(&bins[(id.y - uint(band.x)) / 4 * bw + id.x / 8], 1u, memory_order_relaxed);
+        }
     }
 
-    // Locked overlay px of this 2×2 block (bits of mfg_lock) take the plain blend; chroma too if any is locked.
-    inline void lockOut(thread float *oy, thread float2 &oc, uint bits, uint2 id, texture2d<float, access::sample> ya,
-                        texture2d<float, access::sample> yb, texture2d<float, access::sample> ca, texture2d<float, access::sample> cb) {
-        for (uint q = 0; q < 4; q++) if ((bits >> q) & 1) {
-            uint2 p = id * 2 + uint2(q & 1, q >> 1);
-            oy[q] = kP3Dbg == 1 ? 1.0 : 0.5 * (ya.read(p).r + yb.read(p).r);
+    // Final glyph mask: seeds count only where seeds lie in at least kGBins of the 7 horizontal bins (8 guide px wide)
+    // around (over three bin rows), so an isolated road marking or light never triggers; then grown by at most one
+    // luma px (a steady glyph only onto px where A and B agree, kGCenter), never over the whole box.
+    // Indirect grids for the rows [split, H) of the fused warp: the glyph kernel runs only on the threadgroup rows
+    // within kGReach guide px of a glyph row of this pair, the plain copy on the rest (above and below). args:
+    // three grids (glyph, plain above, plain below) then their first rows. p = (tg cols, tg height, split, H).
+    kernel void mfg_gargs(device const uint *anyG [[buffer(0)]], device uint *args [[buffer(1)]], constant uint4 &p [[buffer(2)]]) {
+        uint th = p.y, nAll = (p.w - p.z + th - 1) / th;
+        uint g0 = nAll, g1 = nAll;                                 // glyph threadgroup rows [g0, g1)
+        if (anyG[0] != 0) {
+            uint y0 = anyG[1] > p.z + 48 ? anyG[1] - 48 : p.z, y1 = anyG[2] + 49;
+            g0 = min(nAll, (y0 - p.z) / th); g1 = min(nAll, (y1 - p.z + th - 1) / th);
         }
-        oc = 0.5 * (ca.read(id).rg + cb.read(id).rg);
+        if (g1 <= g0) { g0 = nAll; g1 = nAll; }
+        args[0] = p.x; args[1] = g1 - g0; args[2] = 1;
+        args[3] = p.x; args[4] = g0; args[5] = 1;
+        args[6] = p.x; args[7] = nAll - g1; args[8] = 1;
+        args[9] = p.z + g0 * th; args[10] = p.z; args[11] = p.z + g1 * th;
+    }
+
+    kernel void mfg_gfinal(texture2d<float, access::read> ya [[texture(0)]], texture2d<float, access::read> yb [[texture(1)]],
+                           texture2d<uint, access::read> S [[texture(2)]], texture2d<uint, access::write> M [[texture(3)]],
+                           device const uint *bins [[buffer(0)]], constant int2 &band [[buffer(1)]], device atomic_uint *anyG [[buffer(2)]],
+                           uint2 tid [[thread_position_in_grid]]) {
+        uint2 id = uint2(tid.x, tid.y + uint(band.x));
+        int W = int(S.get_width());
+        if (int(id.x) >= W || int(id.y) >= band.y) return;
+        uint nb[9]; uint any = 0;
+        for (int k = 0; k < 9; k++) {
+            int2 g = int2(id) + int2(k % 3 - 1, k / 3 - 1);
+            nb[k] = (g.x >= 0 && g.x < W && g.y >= band.x && g.y < band.y) ? S.read(uint2(g)).r : 0u;
+            any |= nb[k];
+        }
+        // Unchanged px next to a glyph seed bin (8 guide px wide, the bin either side: kGGrow) join the steady
+        // glyph: a lone stroke such as a leading "I" seeds poorly (a world vector can map it onto the next stem).
+        // Blending an unchanged px costs at most |A - B| / 2, so the grow is safe off the glyph too.
+        int bw = (W + 7) / 8, nby = (band.y - band.x + 3) / 4, by = (int(id.y) - band.x) / 4, bx = int(id.x) / 8, cnt = 0;
+        bool stNear = (any >> 8) != 0;
+        if (kGGrow && !stNear) for (int x = max(0, bx - 1); x <= min(bw - 1, bx + 1); x++) stNear = stNear || bins[by * bw + x] != 0;
+        if (any == 0 && !stNear) { M.write(uint4(0), id); return; }
+        for (int x = max(0, bx - 3); x <= min(bw - 1, bx + 3); x++) {
+            uint o = 0;
+            for (int y = max(0, by - 1); y <= min(nby - 1, by + 1); y++) o |= bins[y * bw + x];
+            cnt += o != 0 ? 1 : 0;
+        }
+        if (cnt < kGBins) { M.write(uint4(0), id); return; }
+        uint out = 0;
+        int hx = int(ya.get_width()) - 1, hy = int(ya.get_height()) - 1;
+        for (int q = 0; q < 4; q++) {
+            int qx = q & 1, qy = q >> 1;
+            uint own = ((nb[4] >> q) & 1u) | (((nb[4] >> (4 + q)) & 1u) << 1) | (((nb[4] >> (8 + q)) & 1u) << 2);
+            if (own == 0) {
+                uint g = 0;                                           // classes of the luma px within 1 px
+                for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+                    int nx = qx + i, ny = qy + j;                     // local luma px, -1 to 2
+                    int k = ((ny + 2) / 2) * 3 + (nx + 2) / 2;        // guide neighbour (0 to 2 per axis)
+                    uint b = nb[k], qq = uint((ny & 1) * 2 + (nx & 1));
+                    g |= ((b >> qq) & 1u) | (((b >> (4 + qq)) & 1u) << 1) | (((b >> (8 + qq)) & 1u) << 2);
+                }
+                if ((g & 4) || stNear) {
+                    uint2 p = uint2(clamp(int2(id * 2) + int2(qx, qy), int2(0), int2(hx, hy)));
+                    // Unchanged, or a bright stroke px both frames hold (anti-aliased glyph edges over a moving
+                    // background change by a few percent; the bright core is what a world vector would copy).
+                    float la = ya.read(p).r, lb = yb.read(p).r, dl = 1.1644 * fabs(la - lb);
+                    bool bright = (min(la, lb) - 0.0627) * 1.1644 >= kGBright && dl <= 0.06;
+                    own = dl <= kGCenter || (stNear && bright) ? 7u : (g & 3);
+                } else own = g & 3;
+            }
+            out |= ((own & 1u) << q) | (((own >> 1) & 1u) << (4 + q)) | (((own >> 2) & 1u) << (8 + q));
+        }
+        M.write(uint4(out), id);
+        if (out != 0) {
+            atomic_store_explicit(anyG, 1u, memory_order_relaxed);
+            atomic_fetch_min_explicit(anyG + 1, id.y, memory_order_relaxed); atomic_fetch_max_explicit(anyG + 2, id.y, memory_order_relaxed);
+        }
+    }
+    // Glyph classes of the luma px at native position pn (bit 1 glyph in A, 2 in B, 4 steady), 0 outside the band.
+    inline uint gAt(texture2d<uint, access::read> M, int2 band, float2 pn) {
+        int2 n = int2(floor(pn)), g = n >> 1;
+        if (g.y < band.x || g.y >= band.y || g.x < 0 || g.x >= int(M.get_width())) return 0;
+        uint b = M.read(uint2(g)).r, q = uint((n.y & 1) * 2 + (n.x & 1));
+        return ((b >> q) & 1u) | (((b >> (4 + q)) & 1u) << 1) | (((b >> (8 + q)) & 1u) << 2);
+    }
+    // Anti-copy: rejection bits of a luma warp's two samples (luma px px, vector v in guide px).
+    inline uint rejY(texture2d<uint, access::read> M, int2 band, uint2 px, float2 v) {
+        if (band.y <= band.x) return 0;
+        float2 p = float2(px) + 0.5;
+        return ((gAt(M, band, p + 2.0 * TA * v) & 5u) ? 1u : 0u) | ((gAt(M, band, p - 2.0 * TB * v) & 6u) ? 2u : 0u);   // a steady glyph is in both frames
+    }
+    // Chroma texel (guide px) c: a sample whose guide px holds any glyph of that frame is rejected.
+    inline uint rejC(texture2d<uint, access::read> M, int2 band, uint2 c, float2 v) {
+        if (band.y <= band.x) return 0;
+        float2 p = float2(c) + 0.5;
+        int2 pa = int2(floor(p + TA * v)), pb = int2(floor(p - TB * v));
+        int W = int(M.get_width());
+        uint r = 0;
+        if (pa.y >= band.x && pa.y < band.y && pa.x >= 0 && pa.x < W && (M.read(uint2(pa)).r & 0xF0Fu)) r |= 1u;
+        if (pb.y >= band.x && pb.y < band.y && pb.x >= 0 && pb.x < W && (M.read(uint2(pb)).r & 0xFF0u)) r |= 2u;
+        return r;
     }
 
     // Upsample and warp fused (the shipping path): one thread per guide pixel picks its vector and writes its 2×2
     // luma block and its CbCr texel, so the per-pixel field never goes through memory.
+    // Subtitle guard ownership, on both planes: a steady glyph px is the blend of A and B at the same screen position;
+    // a glyph px of A that is not steady (disappearing or changing) holds frame A intact; a glyph px of B only
+    // (onset) is warped from A only (A's state is what the made frame shows); every other px is warped normally,
+    // but a sample that lands on a glyph of its frame is rejected for the other valid world sample (anti-copy).
     kernel void mfg_upwarp(texture2d<float, access::sample> ga [[texture(0)]], texture2d<float, access::sample> gb [[texture(1)]],
                            texture2d<half, access::read> q [[texture(2)]],
                            texture2d<float, access::sample> ya [[texture(3)]], texture2d<float, access::sample> yb [[texture(4)]],
                            texture2d<float, access::write> yo [[texture(5)]],
                            texture2d<float, access::sample> ca [[texture(6)]], texture2d<float, access::sample> cb [[texture(7)]],
-                           texture2d<float, access::write> co [[texture(8)]], texture2d<half, access::read> L [[texture(9)]],
-                           texture2d<half, access::read> Lb [[texture(10)]], texture2d<half, access::read> Lraw [[texture(12)]], texture2d<half, access::read> alt [[texture(11)]],
-                           constant float &G [[buffer(0)]], constant float2 &fb [[buffer(1)]], uint2 id [[thread_position_in_grid]]) {
+                           texture2d<float, access::write> co [[texture(8)]], texture2d<uint, access::read> M [[texture(9)]],
+                           texture2d<half, access::read> alt [[texture(11)]],
+                           constant float &G [[buffer(0)]], constant float2 &fb [[buffer(1)]], constant int2 &bandIn [[buffer(2)]],
+                           constant int &rt [[buffer(3)]], device const uint *anyG [[buffer(4)]], device const int &rowOff [[buffer(5)]],
+                           uint2 tid [[thread_position_in_grid]]) {
+        uint2 id = uint2(tid.x, tid.y + uint(rowOff));
         float2 cs = float2(co.get_width(), co.get_height());
         if (id.x >= uint(cs.x) || id.y >= uint(cs.y)) return;
         float2 s = float2(yo.get_width(), yo.get_height());
-        // Static overlay (P3_LOCK): its pixels are never warped, the plain blend of both frames.
-        if (kP3Dbg == 9) {
-            uint r = uint(round(float(Lraw.read(id).r) * 255.0));
-            for (uint q = 0; q < 4; q++) yo.write(float4(r == 64 ? 0.3 : r == 128 ? 0.45 : ((r >> q) & 1) ? 1.0 : (((r >> (q + 4)) & 1) ? 0.6 : 0.1)), id * 2 + uint2(q & 1, q >> 1));
+        int2 band = (kP3 & P3_GLYPH) && !kNoGlyph && anyG[0] != 0 ? bandIn : int2(0);   // no glyph this pair: no lookups at all
+        // Own glyph classes per luma px: fixed (steady: blend; glyph of A: A) or onset (B only: A side only).
+        uint gm = (int(id.y) >= band.x && int(id.y) < band.y) ? M.read(id).r : 0u;
+        uint stq = (gm >> 8) & 15u, aq = gm & 15u & ~stq, bq = (gm >> 4) & 15u & ~stq & ~aq;
+        uint fixq = stq | aq;
+        if (kP3Dbg == 1 && (kP3 & P3_GLYPH)) {
+            for (uint k = 0; k < 4; k++) yo.write(float4(((stq >> k) & 1) ? 1.0 : ((aq >> k) & 1) ? 0.75 : ((bq >> k) & 1) ? 0.45 : 0.08), id * 2 + uint2(k & 1, k >> 1));
             co.write(float4(0.5, 0.5, 0, 1), id); return;
         }
-        bool lk = false, lkAll = false; uint lbits = 0;
-        if ((kP3 & P3_LOCK) && L.read(id).r > 0.5) {             // dilated mask first: most pixels stop here
-            lbits = uint(round(float(Lb.read(id).r) * 255.0));
-            lk = lbits != 0; lkAll = lbits == 15;
-        }
-        if (lkAll) {
-            for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) yo.write(float4(kP3Dbg == 1 ? 1.0 : 0.5 * (ya.read(id * 2 + uint2(i, j)).r + yb.read(id * 2 + uint2(i, j)).r)), id * 2 + uint2(i, j));
-            co.write(float4(0.5 * (ca.read(id).rg + cb.read(id).rg), 0, 1), id);
+        // Chroma texel: a steady glyph px in it = blend, else a glyph of A = A, else an onset px = A side only.
+        bool cFix = fixq != 0, cOnset = !cFix && bq != 0;
+        float2 cFixV = stq != 0 ? 0.5 * (ca.read(id).rg + cb.read(id).rg) : ca.read(id).rg;
+        float oy[4] = { 0, 0, 0, 0 }; float2 oc = 0;
+        if (fixq == 15u) {
+            for (uint k = 0; k < 4; k++) { uint2 p = id * 2 + uint2(k & 1, k >> 1); yo.write(float4(((stq >> k) & 1) ? 0.5 * (ya.read(p).r + yb.read(p).r) : ya.read(p).r), p); }
+            co.write(float4(cFixV, 0, 1), id);
             return;
         }
-        if (kP3 & P3_SOFT) {
-            // Soft upsample (P3_SOFT): where the 4 surrounding cells disagree and their vectors match this pixel about
+        bool done = false;
+        if ((kP3 & P3_SOFT) && kSoftV2 && rt != 1) {
+            // Soft upsample, v0.6 form (same idea as the v0.5 loop below, in a few registers): the 3×3 cells around the
+            // pixel with a tent 1.5 cells wide stream into at most 3 entries (a cell joins an entry whose vector is
+            // within kSoftM px on the same side, as their weighted mean; a fourth distinct vector is dropped). Each
+            // entry is scored at the pixel, weighted bw * exp(-(c - c_min) / kSoftS), and the kSoftTop (2) strongest
+            // are warped. v0.5 kept up to 10 entries in a dynamically indexed array: spilled registers made the whole
+            // pass about 4 ms slower than the hard pick.
+            int2 hi = int2(q.get_width() - 1, q.get_height() - 1);
+            float2 m = float2(id) + 0.5, u = m / G - 0.5;
+            int2 cbs = int2(floor(u + 0.5)) - 1;
+            float4 e0 = 0, e1 = 0, e2 = 0; float b0 = 0, b1 = 0, b2 = 0;
+            bool side = false, zm = false;
+            for (int k = 0; k < 9; k++) {
+                int2 cc = cbs + int2(k % 3, k / 3);
+                float2 dd = fabs(u - float2(cc));
+                float b = max(0.0, 1.0 - dd.x / 1.5) * max(0.0, 1.0 - dd.y / 1.5);
+                if (b <= 0) continue;
+                float4 e = float4(q.read(uint2(clamp(cc, int2(0), hi))));
+                side = side || (e.w != 0 && e.w != 4); zm = zm || e.w == 4;
+                if (b0 > 0 && e0.w == e.w && all(fabs(e0.xy - e.xy) < max(kSoftM, kSoftMR * length(e.xy)))) { e0.xyz = (e0.xyz * b0 + e.xyz * b) / (b0 + b); b0 += b; }
+                else if (b1 > 0 && e1.w == e.w && all(fabs(e1.xy - e.xy) < max(kSoftM, kSoftMR * length(e.xy)))) { e1.xyz = (e1.xyz * b1 + e.xyz * b) / (b1 + b); b1 += b; }
+                else if (b2 > 0 && e2.w == e.w && all(fabs(e2.xy - e.xy) < max(kSoftM, kSoftMR * length(e.xy)))) { e2.xyz = (e2.xyz * b2 + e.xyz * b) / (b2 + b); b2 += b; }
+                else if (b0 <= 0) { e0 = e; b0 = b; }
+                else if (b1 <= 0) { e1 = e; b1 = b; }
+                else if (b2 <= 0) { e2 = e; b2 = b; }
+            }
+            if (!side || kSoftSide) {
+                float2 gsz = float2(ga.get_width(), ga.get_height());
+                float c0 = 0, c1 = 1e9, c2 = 1e9;
+                float w0 = b0, w1 = b1, w2 = b2;
+                if (b1 > 0 && rt != 5) {
+                    for (int t = 0; t < 3; t++) {
+                        float bt = t == 0 ? b0 : t == 1 ? b1 : b2;
+                        if (bt <= 0) continue;
+                        float4 e = t == 0 ? e0 : t == 1 ? e1 : e2;
+                        float2 d = e.xy;
+                        float c;
+                        if (kBorder && !(inF(m + TA * d, gsz) && inF(m - TB * d, gsz))) c = (kP3 & P3_EDGE) ? max(0.04, e.z) : 0.04;
+                        else if (zm) c = zmCost(ga, gb, m, d);
+                        else c = (kSoftC == 1 ? sad9(ga, gb, m + TA * d, m - TB * d) : kSoftC == 2 ? sad5(ga, gb, m + TA * d, m - TB * d) : upCost(ga, gb, m, d, 1e9))
+                                 - (all(fabs(d) < 0.25) ? 0.004 : 0.0);
+                        if (t == 0) c0 = c; else if (t == 1) c1 = c; else c2 = c;
+                    }
+                    float cmin = min(c0, min(c1, c2));
+                    w0 = b0 * exp(-(c0 - cmin) / kSoftS); w1 = b1 * exp(-(c1 - cmin) / kSoftS); w2 = b2 > 0 ? b2 * exp(-(c2 - cmin) / kSoftS) : 0.0;
+                    // An unchanged pixel that wins on the zero vector keeps it alone (static HUD before the mask learns it).
+                    int z0 = (all(fabs(e0.xy) < 0.25) && e0.w == 0) ? 0 : (all(fabs(e1.xy) < 0.25) && e1.w == 0) ? 1 : (b2 > 0 && all(fabs(e2.xy) < 0.25) && e2.w == 0) ? 2 : -1;
+                    float cz = z0 == 0 ? c0 : z0 == 1 ? c1 : c2;
+                    if (z0 >= 0 && cz <= cmin && cz < kSoftH) { w0 = z0 == 0 ? 1.0 : 0.0; w1 = z0 == 1 ? 1.0 : 0.0; w2 = z0 == 2 ? 1.0 : 0.0; }
+                }
+                // Order: the kSoftTop (2 or 3) strongest entries.
+                if (w1 > w0) { float4 te = e0; e0 = e1; e1 = te; float tw = w0; w0 = w1; w1 = tw; }
+                if (w2 > w1) { float4 te = e1; e1 = e2; e2 = te; float tw = w1; w1 = w2; w2 = tw; }
+                if (w1 > w0) { float4 te = e0; e0 = e1; e1 = te; float tw = w0; w0 = w1; w1 = tw; }
+                if (kSoftTop < 3 || b2 <= 0) w2 = 0;
+                if (kSoftTop < 2 || rt == 6) { w1 = 0; w2 = 0; }
+                float ws = w0 + w1 + w2, k1 = w0 / ws, k2 = w1 / ws, k3 = w2 / ws;
+                if (k3 < kSoftKMin) k3 = 0;
+                if (k2 < kSoftKMin) { k2 = 0; k3 = 0; }
+                float kn = k1 + k2 + k3;
+                float kf[4] = { 0, 0, 0, 0 }, kfc = 0;
+                for (int t = 0; t < 3; t++) {
+                    float k = t == 0 ? k1 : t == 1 ? k2 : k3;
+                    if (k <= 0) continue;
+                    float4 e = t == 0 ? e0 : t == 1 ? e1 : e2;
+                    // Anti-copy per guide px (kGFine: per luma px): two mask reads per entry, shared by both planes.
+                    uint rjb = rejC(M, band, id, e.xy);
+                    for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) {
+                        uint qi = j * 2 + i; uint2 p = id * 2 + uint2(i, j);
+                        if ((fixq >> qi) & 1) continue;
+                        float f = 0;
+                        float o = warpY0(ya, yb, e, p, s, fb, f, (kGFine ? rejY(M, band, p, e.xy) : rjb) | (((bq >> qi) & 1) ? 2u : 0u));
+                        oy[qi] += k * (1.0 - f) * o; kf[qi] += k * f;
+                    }
+                    if (!cFix) {
+                        float fc = 0;
+                        float2 cc2 = warpC0(ca, cb, e, id, cs, fb, fc, rjb | (cOnset ? 2u : 0u));
+                        oc += k * (1.0 - fc) * cc2; kfc += k * fc;
+                    }
+                }
+                for (uint qi = 0; qi < 4; qi++) {
+                    uint2 p = id * 2 + uint2(qi & 1, qi >> 1);
+                    if (kf[qi] > 0 && !((fixq >> qi) & 1)) oy[qi] += kf[qi] * plainY(ya, yb, p, (bq >> qi) & 1);
+                    oy[qi] = kP3Dbg == 2 ? 1.0 : oy[qi] / kn;
+                }
+                if (!cFix) { if (kfc > 0) oc += kfc * plainC(ca, cb, id, cOnset); oc /= kn; }
+                done = true;
+            }
+        }
+        if ((kP3 & P3_SOFT) && !kSoftV2 && rt != 1) {
+            // Soft upsample (P3_SOFT): where the surrounding cells disagree and their vectors match this pixel about
             // equally well, a hard per-pixel pick leaves the cell grid's 8-px staircase in the picture (each side
-            // samples different content). Each cell's warp is weighted by its bilinear position weight and by how
-            // well its vector matches here (exp(-(c - c_min) / kSoftS)): a clear winner stays a hard edge (object
-            // outlines), a near tie becomes a smooth cross-fade (overlapped block motion compensation).
+            // samples different content). Each cell's warp is weighted by its spatial weight and by how well its
+            // vector matches here (exp(-(c - c_min) / kSoftS)): a clear winner stays a hard edge (object outlines), a
+            // near tie becomes a smooth cross-fade (overlapped block motion compensation).
+            // Static-HUD cells (P3_HUDPX) also offer the moving vector they gave up.
+            // Entries: distinct (vector, fade cost, side) with their summed spatial weight. kSoftK = 1: the 3×3 cells
+            // around the pixel with a tent 1.5 cells wide, so a vector that matches well reaches past its own cell.
             int2 hi = int2(q.get_width() - 1, q.get_height() - 1);
             float2 m = float2(id) + 0.5, u = m / G - 0.5;
             int2 c0 = int2(floor(u));
             float2 fr = clamp(u - float2(c0), 0.0, 1.0);
-            // Static-HUD cells (P3_HUDPX) also offer the moving vector they gave up: the learned mask is per 8-px
-            // cell, so the road under a subtitle line would otherwise keep the zero vector (a blended block). The
-            // pixel decides by its own match; locked text and real HUD pixels match the zero vector best.
-            // Entries: distinct (vector, fade cost, side) with their summed spatial weight. kSoftK = 1: the 3×3 cells
-            // around the pixel with a tent 1.5 cells wide, so a vector that matches well reaches past its own cell
-            // (the edge between two vector regions follows the match, not the cell grid).
-            float4 v[10]; float bw[10]; int n = 0; bool side = false, zdiff = false;
+            float4 v[SOFTN]; float bw[SOFTN]; int n = 0; bool side = false, zdiff = false, zm = false;
             int K = kSoftK ? 3 : 2;
             int2 cbase = kSoftK ? int2(floor(u + 0.5)) - 1 : c0;
             for (int jj = 0; jj < K; jj++) for (int ii = 0; ii < K; ii++) {
@@ -1589,7 +2018,8 @@ public final class MotionInterpolator: @unchecked Sendable {
                         if (a.w <= 0) break;
                         e = float4(float2(a.xy), float(a.z), 0);
                     }
-                    side = side || e.w != 0;
+                    side = side || (e.w != 0 && e.w != 4);
+                    zm = zm || e.w == 4;
                     int r = -1;
                     for (int t = 0; t < n; t++) if (all(fabs(v[t].xy - e.xy) < kSoftM) && v[t].w == e.w) { r = t; break; }
                     // Same vector (within kSoftM px: warping with the mean vector ≈ blending the two warps): one entry,
@@ -1598,72 +2028,87 @@ public final class MotionInterpolator: @unchecked Sendable {
                         zdiff = zdiff || any(v[r].xyz != e.xyz);
                         v[r].xyz = (v[r].xyz * bw[r] + e.xyz * wg) / (bw[r] + wg); bw[r] += wg;
                     }
-                    else if (n < 10) { v[n] = e; bw[n] = wg; n++; }
+                    else if (n < SOFTN) { v[n] = e; bw[n] = wg; n++; }
                 }
             }
             bool same = n == 1 && (!zdiff || !kSoftZS);
-            if (kP3Dbg == 3) { for (uint q2 = 0; q2 < 4; q2++) yo.write(float4(n > 4 ? 1.0 : 0.0), id * 2 + uint2(q2 & 1, q2 >> 1)); co.write(float4(0.5, 0.5, 0, 1), id); return; }
+            if (kP3Dbg == 3) { for (uint k = 0; k < 4; k++) yo.write(float4(n > 1 ? 1.0 : 0.0), id * 2 + uint2(k & 1, k >> 1)); co.write(float4(0.5, 0.5, 0, 1), id); return; }
             if (!same && (!side || kSoftSide)) {
                 float2 gsz = float2(ga.get_width(), ga.get_height());
-                float w[10], cmin = 1e9; int z0 = -1;
-                if (n > 1) for (int t = 0; t < n; t++) {
-                    float2 d = v[t].xy;
-                    float c;
-                    if (kBorder && !(inF(m + 0.5 * d, gsz) && inF(m - 0.5 * d, gsz))) c = (kP3 & P3_EDGE) ? max(0.04, v[t].z) : 0.04;
-                    else c = (kSoftC ? sad9(ga, gb, m + 0.5 * d, m - 0.5 * d) : upCost(ga, gb, m, d, 1e9)) - (all(fabs(d) < 0.25) ? 0.004 : 0.0);
-                    w[t] = c; cmin = min(cmin, c);
-                    if (all(fabs(d) < 0.25) && v[t].w == 0) z0 = t;
+                float w[SOFTN], cmin = 1e9; int z0 = -1;
+                if (n > 1 && rt != 3) {
+                    // Score order: the entry with the largest spatial weight first (a tight early-exit bound).
+                    float bsum = 0; int i0 = 0;
+                    for (int t = 0; t < n; t++) { bsum += bw[t]; if (bw[t] > bw[i0]) i0 = t; }
+                    for (int r = 0; r < n; r++) {
+                        int t = r == 0 ? i0 : (r <= i0 ? r - 1 : r);
+                        float2 d = v[t].xy;
+                        float c;
+                        if ((kSoftFast & 2) && bw[t] < 0.04 * bsum) c = 1e9;           // a sliver of a far cell
+                        else if (kBorder && !(inF(m + TA * d, gsz) && inF(m - TB * d, gsz))) c = (kP3 & P3_EDGE) ? max(0.04, v[t].z) : 0.04;
+                        else if (zm) c = zmCost(ga, gb, m, d);
+                        else {
+                            float bnd = (kSoftFast & 1) && cmin < 1e8 ? cmin + 4.0 * kSoftS : 1e9;
+                            c = kSoftC == 1 ? sad9(ga, gb, m + TA * d, m - TB * d) : kSoftC == 2 ? sad5(ga, gb, m + TA * d, m - TB * d) : upCost(ga, gb, m, d, bnd);
+                            if (c >= bnd) c = 1e9;                                     // surely under 2 % of the weight
+                            else c -= all(fabs(d) < 0.25) ? 0.004 : 0.0;
+                        }
+                        w[t] = c; cmin = min(cmin, c);
+                        if (all(fabs(d) < 0.25) && v[t].w == 0) z0 = t;
+                    }
                 }
                 // A pixel that did not change between the frames and wins on the zero vector (static HUD before the
                 // mask has learned it, a still background) keeps it alone: the soft mix would pull in moving content.
+                if (rt == 3) { for (int t = 0; t < n; t++) w[t] = 0; cmin = 0; }
                 bool zh = n > 1 && z0 >= 0 && w[z0] <= cmin && w[z0] < kSoftH;
                 float ws = 0;
-                for (int t = 0; t < n; t++) { w[t] = zh ? (t == z0 ? 1.0 : 0.0) : n > 1 ? bw[t] * exp(-(w[t] - cmin) / kSoftS) : 1.0; ws += w[t]; }
+                for (int t = 0; t < n; t++) { w[t] = zh ? (t == z0 ? 1.0 : 0.0) : n > 1 ? (w[t] > 1e8 ? 0.0 : bw[t] * exp(-(w[t] - cmin) / kSoftS)) : 1.0; ws += w[t]; }
                 // Σ k_t ((1 - f_t) o_t + f_t blend) = Σ k_t (1 - f_t) o_t + (Σ k_t f_t) blend: the plain blend once.
-                float oy[4] = { 0, 0, 0, 0 }; float2 oc = 0; float kn = 0, kf = 0, kfc = 0, dvx = 0, dfz = 0;
+                float kn = 0, kf[4] = { 0, 0, 0, 0 }, kfc = 0;
                 for (int t = 0; t < n; t++) {
                     float k = w[t] / ws;
-                    if (k < 0.02) continue;
+                    if (k < kSoftKMin || (rt == 2 && k < 0.5)) continue;
                     kn += k;
-                    float4 v0 = v[t];
-                    if ((kP3 & P3_LOCK) && kLockSrc) v[t] = lockFix(L, m, v[t]);
-                    dvx += k * (kP3Dbg == 8 ? float(any(v0 != v[t])) * 50.0 : v[t].y); dfz += k * v[t].z;
-                    float f = 0;
                     for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) {
-                        float o = warpY0(ya, yb, v[t], id * 2 + uint2(i, j), s, fb, f);
-                        oy[j * 2 + i] += k * (1.0 - f) * o;
+                        uint qi = j * 2 + i; uint2 p = id * 2 + uint2(i, j);
+                        if ((fixq >> qi) & 1) continue;
+                        uint rj = rejY(M, band, p, v[t].xy) | (((bq >> qi) & 1) ? 2u : 0u);
+                        float f = 0;
+                        float o = warpY0(ya, yb, v[t], p, s, fb, f, rj);
+                        oy[qi] += k * (1.0 - f) * o; kf[qi] += k * f;
                     }
-                    kf += k * f;
-                    float fc = 0;
-                    float2 c2 = warpC0(ca, cb, v[t], id, cs, fb, fc);
-                    oc += k * (1.0 - fc) * c2; kfc += k * fc;
+                    if (!cFix) {
+                        float fc = 0;
+                        float2 c2 = warpC0(ca, cb, v[t], id, cs, fb, fc, rejC(M, band, id, v[t].xy) | (cOnset ? 2u : 0u));
+                        oc += k * (1.0 - fc) * c2; kfc += k * fc;
+                    }
                 }
-                if (kf > 0) for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) {
-                    float2 p = float2(id * 2 + uint2(i, j)) + 0.5;
-                    oy[j * 2 + i] += kf * 0.5 * (ya.sample(lc, p).r + yb.sample(lc, p).r);
+                for (uint qi = 0; qi < 4; qi++) {
+                    uint2 p = id * 2 + uint2(qi & 1, qi >> 1);
+                    if (kf[qi] > 0 && !((fixq >> qi) & 1)) oy[qi] += kf[qi] * plainY(ya, yb, p, (bq >> qi) & 1);
+                    oy[qi] = kP3Dbg == 2 ? 1.0 : oy[qi] / kn;
                 }
-                if (kfc > 0) { float2 p = float2(id) + 0.5; oc += kfc * 0.5 * (ca.sample(lc, p).rg + cb.sample(lc, p).rg); }
-                if (kP3Dbg >= 4) { for (uint q2 = 0; q2 < 4; q2++) yo.write(float4(kP3Dbg == 4 || kP3Dbg == 8 ? 0.5 + dvx / kn / 50.0 : kP3Dbg == 6 ? 0.5 + dvx / kn / 200.0 : kP3Dbg == 7 ? 0.3 : min(dfz / kn * 10.0, 1.0)), id * 2 + uint2(q2 & 1, q2 >> 1)); co.write(float4(0.5, 0.5, 0, 1), id); return; }
-                for (uint q2 = 0; q2 < 4; q2++) oy[q2] = kP3Dbg == 2 ? 1.0 : oy[q2] / kn;
-                oc /= kn;
-                if (lk) lockOut(oy, oc, lbits, id, ya, yb, ca, cb);
-                for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) yo.write(float4(oy[j * 2 + i]), id * 2 + uint2(i, j));
-                co.write(float4(oc, 0, 1), id);
-                return;
+                if (!cFix) { if (kfc > 0) oc += kfc * plainC(ca, cb, id, cOnset); oc /= kn; }
+                done = true;
             }
         }
-        float4 v = float4(upPick(ga, gb, q, G, id));
-        if ((kP3 & P3_LOCK) && kLockSrc) v = lockFix(L, float2(id) + 0.5, v);
-        float hy[4];
-        if (kP3Dbg >= 4) { for (uint q2 = 0; q2 < 4; q2++) yo.write(float4(kP3Dbg == 4 ? 0.5 + v.y / 50.0 : kP3Dbg == 6 ? 0.5 + v.y / 200.0 : kP3Dbg == 7 ? 0.7 + 0.1 * v.w : min(v.z * 10.0, 1.0)), id * 2 + uint2(q2 & 1, q2 >> 1)); co.write(float4(0.5, 0.5, 0, 1), id); return; }
-        for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) {
-            uint2 p = id * 2 + uint2(i, j);
-            hy[j * 2 + i] = warpY(ya, yb, v, p, s, fb);
+        if (!done) {
+            float4 v = float4(upPick(ga, gb, q, G, id));
+            for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) {
+                uint qi = j * 2 + i; uint2 p = id * 2 + uint2(i, j);
+                if ((fixq >> qi) & 1) continue;
+                bool on = (bq >> qi) & 1;
+                oy[qi] = warpY(ya, yb, v, p, s, fb, rejY(M, band, p, v.xy) | (on ? 2u : 0u), on);
+            }
+            if (!cFix) oc = warpC(ca, cb, v, id, cs, fb, rejC(M, band, id, v.xy) | (cOnset ? 2u : 0u), cOnset);
         }
-        float2 hc = warpC(ca, cb, v, id, cs, fb);
-        if (lk) lockOut(hy, hc, lbits, id, ya, yb, ca, cb);
-        for (uint j = 0; j < 2; j++) for (uint i = 0; i < 2; i++) yo.write(float4(hy[j * 2 + i]), id * 2 + uint2(i, j));
-        co.write(float4(hc, 0, 1), id);
+        for (uint qi = 0; qi < 4; qi++) {
+            uint2 p = id * 2 + uint2(qi & 1, qi >> 1);
+            if ((fixq >> qi) & 1) oy[qi] = ((stq >> qi) & 1) ? 0.5 * (ya.read(p).r + yb.read(p).r) : ya.read(p).r;
+            yo.write(float4(oy[qi]), p);
+        }
+        co.write(float4(cFix ? cFixV : oc, 0, 1), id);
     }
+
     """
 }

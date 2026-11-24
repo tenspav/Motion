@@ -90,6 +90,21 @@ Per-stage GPU time on an M2 (1080p, v0.4 before the fused path):
 | Guide | 0.5 ms |
 | VideoToolbox motion (CPU wait) | 2.35 ms |
 
+### Since v0.6: Pass 3 by default, subtitle guard
+
+- **Soft upsample in registers:** the 3×3 cells around a pixel stream into at most three merged entries (vectors within `max(2 px, 0.3 |v|)` on the same side), each scored at the pixel and weighted `exp(-(c - c_min) / 0.12)`; the three strongest are warped. Same picture as the v0.5 loop within 0.03 dB, about 3 ms cheaper at p95 (no spilled registers).
+- **Pair-local subtitle guard (`P3_GLYPH`, `mfg_gseed` + `mfg_gfinal`, replaces the overlay lock):** in the lower band of the picture, bright strokes next to dark edges that the local world motion (the VideoToolbox vector that best explains the patch, zero excluded) does not explain are glyph seeds: steady (in A and B), onset (B only) or offset (A only). Grouped seeds make a mask, grown over unchanged pixels and bright strokes nearby. Steady glyph pixels take the plain blend, offset pixels take A, and no warp samples a glyph pixel of a frame that holds it (that side is dropped). The band rows run the guarded warp kernel only near a glyph row of this pair; all other rows run a copy compiled without it.
+- **Shadow retry (`P3_SHADOW`, off):** a zero-mean match for cells whose two best vectors disagree under a brightness change (shadow over road). Admitted cells keep both endpoints. Neutral on every bench clip, so it stays off.
+
+### Experimental: 120 FPS (4x mode)
+
+On a 120 Hz display Motion can make three frames per real pair instead of one: t = 0.25, 0.5 and 0.75 (30 → 120 FPS). In FramePortal it is an experimental setting, off by default, shown only when Motion is on and the display reaches 120 Hz; streams up to 4K. The API is `interpolate4(prev:cur:)`, which returns the three frames in order.
+
+- **One pair's work, three frames:** guides, both motion searches, the anchored fields, the subtitle mask and the static-HUD evidence run once per pair. Splat, select, grid fix and the fused warp run once per t, from kernels specialised with the time (`kT`): A is sampled at m + t·d and B at m − (1 − t)·d, the A field splats t of its way and the B field 1 − t, and A and B blend (1 − t) : t. The extra passes do not update the per-pair state (`kPairWork`). With t = 0.5 the kernels compile to the 60 FPS code: the 60 FPS output is bit-identical with or without the 4x passes built.
+- **Presentation:** the three made frames, then the real one, each on its own refresh (`PacedCadence` at 120, stride 1; `PresentQueue` 6 deep for the four-frame bursts).
+- **Cost guard:** the whole pair is timed. A median over 25 ms (24 pairs) or 6 pairs over 30 ms falls back to Motion's 60 FPS midpoint, logged ("Motion 120 FPS stepped down to 60 FPS").
+- The 60 FPS recording keeps the midpoint only.
+
 ### Shader stages
 
 | Stage | Resolution | What it does |
@@ -172,13 +187,13 @@ These are environment variables for A/B benchmarks. The defaults are what ships.
 | `MFG_MARGIN` | 0 | Bit 8: unique-match margin for splat overrides. Off: measured worse (see MOTION_PROGRESS v0.5). |
 | `MFG_SUBPIX` | 1 | Bit 16: parabolic sub-pixel fit (`MFG_SUBC` 0.04: winners under this cost only). |
 | `MFG_HOLE` | 1 | Bit 64: 1-ring pull for midpoint cells over `MFG_HOLEC` (0.08). |
-| `MFG_P3` | 0 | Pass 3 changes as a bit mask. Off by default in v0.5-beta: 7 (all three) costs +4.6 ms p50 / +6 ms p95 per made frame, which misses the 60 FPS deadline on an M2 at p95. Set 7 to try it. The per-feature switches below override single bits. |
-| `MFG_SOFT` | 1 | Bit 1: soft upsample. `MFG_SOFTS` 0.06 (cost scale), `MFG_SOFTK` 1 (3×3 tent; 0 = 2×2 bilinear, about 2 ms faster, −0.2 dB), `MFG_SOFTM` 2 (merge radius, px), `MFG_SOFTH` 0.012 (unchanged-pixel rule). |
-| `MFG_LOCK` | 1 | Bit 2: per-pixel overlay lock. `MFG_LOCKD` 0.02, `MFG_LOCKW` 0.15, `MFG_LOCKC` 0.25 (contrast), `MFG_LOCKB` 0.45 (stroke), `MFG_LOCKK` 0.2 (shadow), `MFG_LOCKSRC` 1 (never sample locked px). |
+| `MFG_P3` | 7 | Pass 3 changes as a bit mask (on by default since v0.6: about +2.4 ms p50 / +2.7 ms p95 over the Pass 2 picture). The per-feature switches below override single bits. |
+| `MFG_SOFT` | 1 | Bit 1: soft upsample. `MFG_SOFTS` 0.12 (cost scale), `MFG_SOFTM` 2 / `MFG_SOFTMR` 0.3 (merge radius: px / share of the vector length), `MFG_SOFTTOP` 3 (entries warped, 2 or 3), `MFG_SOFTKMIN` 0 (weight under which an entry is dropped), `MFG_SOFTH` 0.004 (unchanged-pixel rule). `MFG_SOFTV2=0` runs the v0.5 loop (`MFG_SOFTK` 1: 3×3 tent, 0 = 2×2 bilinear), about 2 ms slower. |
+| `MFG_GLYPH` | 1 | Bit 2: pair-local subtitle guard (v0.6; replaces v0.5's `MFG_LOCK`). `MFG_GBAND` 0.70,0.98 (rows, share of the height), `MFG_GSTROKE` 0.035, `MFG_GBRIGHT` 0.45, `MFG_GCENTER` 0.012, `MFG_GSHAPE` 0.025, `MFG_GWORLD` 0.02, `MFG_GMOVE` 2, `MFG_GBINS` 3, `MFG_GONSET` 1, `MFG_GGROW` 1, `MFG_GFINE` 0 (anti-copy per luma px). |
 | `MFG_EDGE` | 1 | Bit 4: frame-edge fade and distance weighting. |
-| `MFG_CMATCH` | 0 | Bit 8: contrast-adjusted match on ambiguous cells (`MFG_CMT` 0.04). |
+| `MFG_SHADOW` | 0 | Bit 8: shadow-over-road zero-mean retry (v0.6; replaces v0.5's `MFG_CMATCH`). `MFG_SHCORR` 0.75, `MFG_SHEZ` 0.012, `MFG_SHMARGIN` 0.004, `MFG_SHMD` 0.015, `MFG_SHTEX` 0.012, `MFG_SHFB` 1. Neutral on the benches. |
 | `MFG_HUDPX` | 0 | Bit 32: static-HUD cells offer their moving vector per pixel. |
-| `MFG_P3DBG` | 0 | Debug views of Pass 3 (1 = lock mask, 5 = fade cost, 9 = raw lock bits). |
+| `MFG_P3DBG` | 0 | Debug views of Pass 3 (1 = glyph mask, 2 = soft-path pixels, 4 = anti-copy rejections). |
 | `MFG_TG` | | Threadgroup shape per kernel for sweeps, e.g. `mfg_anchor=8x8,mfg_upwarp=32x4`. |
 | `MFG_VERBOSE` | 0 | 1 = print shader compile errors. |
 | `FG_DEBUG_VIEW` | 0 | 1 = occlusion map, 2 = horizontal vector, written into the luma plane. |
@@ -189,5 +204,7 @@ These are environment variables for A/B benchmarks. The defaults are what ships.
 # Real recording (any 1080p30 or lower video): frames i and i+2 make a midpoint, scored against the real frame i+1
 swift run -c release motion-bench clip.mp4 --count 300 [--no-apple] [--start S]
 ```
+
+The 4x (120 FPS) and recording benches live in the FramePortal app and are not in this repo.
 
 The engine is a single file: [`Sources/Motion/MotionFrameGen.swift`](Sources/Motion/MotionFrameGen.swift).
