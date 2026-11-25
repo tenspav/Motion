@@ -2,7 +2,7 @@
 
 Motion is a real-time frame-generation engine for Apple silicon. It turns a 30 FPS game stream into 60 FPS by building one new frame between every two real frames. It is an alternative to Apple's built-in interpolator (`VTLowLatencyFrameInterpolation`), and it is currently in **beta**. It was built for low-latency PS5 Remote Play streaming and runs in the FramePortal app.
 
-**Current version: Motion v0.7-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
+**Current version: Motion v0.8-beta.** Motion is versioned separately from the app. It becomes v1.0, and the default engine, once it is visually as clean as Apple's.
 
 Engineering log and benchmark history: [MOTION_PROGRESS.md](MOTION_PROGRESS.md).
 
@@ -198,8 +198,23 @@ These are environment variables for A/B benchmarks. The defaults are what ships.
 | `MFG_CUT` | 1 | v0.7: hard scene cut → every made frame of the pair is a clean copy of A. `MFG_CUTS` 0.45 (guide texture change), `MFG_CUTH` 0.45 (histogram distance), `MFG_CUTP` 0.05 (share of cells costing over 0.04). `MFG_CUTLOG=1` prints the evidence per pair. |
 | `MFG_REJECT` | | v0.7: a pair over `rejectFraction` (30 % bad cells) is a clean repeat of A; `skip` = the v0.6 skip (completion nil). |
 | `MFG_Q10` | 1 | v0.7: 10-bit made frames written as canonical x420 codes (low 6 bits zero). |
-| `MFG_GFOOT` | 0 | v0.7: subtitle anti-copy tests all four bilinear taps. Off: no visible change, −0.02 dB on 20-55-31. |
+| `MFG_GFOOT` | 0 | v0.7: subtitle anti-copy tests all four bilinear taps. Off: no visible change, −0.02 dB on Rec 1. |
 | `MFG_SELX` | 0 | v0.7: exact early exit in the selection window. Off: bit-identical but 0.1 ms slower on an M2. |
+| `MFG_PRE` | 1 | v0.8: buffer clears, the subtitle seed pre-test and the anchored search's zero and temporal-seed scores run in their own command buffer while VideoToolbox searches; the scores are replayed exactly in candidate order. Bit-identical. |
+| `MFG_SPLIT` | 1 | v0.8: the anchored search is committed before the rest of the pair is encoded. Bit-identical. |
+| `MFG_HUDSKIP` | 1 | v0.8: static-HUD crossing reads are skipped while the previous pair's mask has no masked cell. Bit-identical. |
+| `MFG_REORDER` | 1 | v0.8: gfinal runs beside the splat, gargs and the long-term means beside the grid fix: two fewer GPU drains. Bit-identical. |
+| `MFG_REACH` | 0 | v0.8: subtitle-guard reach from the measured vertical motion (VideoToolbox and splatted fields) instead of a fixed 48 guide px. Not bit-identical, same dB and 0.00 % HUD error; off until checked live. |
+| `MFG_AEXIT` | 0 | v0.8: per-row early exit in the anchored match. Not bit-identical and slower on an M2. |
+| `MFG_SPLAT3` | 0 | v0.8, 4x: one splat traversal for all three phases. Bit-identical, slower on an M2 (register pressure). |
+| `MFG_PHASE` | 0 | v0.8, 4x: one command buffer per phase, t = 0.25 delivered first (`trySubmit4(onPhase:)`). Bit-identical; live 120 Hz check pending. |
+| `MFG_FADE` | 1 | v0.8: fade and exposure guard. While VideoToolbox searches, the A/B luma relation is measured on the guides (CPU, every 4th guide px, 16×9 zones, about 0.55 ms off the critical path). A pair triggers when the median zone mean change is over `MFG_FADEM` 0.03 or the median zone log contrast ratio is over `MFG_FADER` 0.15, with at least `MFG_FADEA` 0.6 of the zones agreeing; or, for a still picture, over `MFG_FADEM2` 0.01 / `MFG_FADER2` 0.04 (textured zones only) with a pooled zero-motion correlation of at least `MFG_FADEC2` 0.97. Pairs under the trigger are bit-identical. `MFG_FADELOG=1` prints each fade pair, `=2` every pair. |
+| `MFG_FADEMS` | 0.3 | The mean-change trigger also needs the median zone change to exceed this share of the global std (a high-contrast pattern panning moves zone means by chance). |
+| `MFG_FSTATIC` | 1 | Static picture (a map or menu left open, no fade): when at least `MFG_STATN` 0.5 of the zones are static (RMS A/B guide difference under `MFG_STATD` 0.006), the static zones whose four neighbours are static too take the plain A/B blend instead of the warp (a wrong nonzero vector there copied dark specks). Every zone static: one pass, no copy of the warp. |
+| `MFG_FNORM` | 1 | Fade pair that is warped: B's guide is normalized to A (gain and offset per zone, bilinear between zone centres) and the VideoToolbox searches are redone on it (fade pairs only); every guide cost after it uses it too. The long-term HUD means keep the raw guide. |
+| `MFG_FXF` | 1 | Fade pair: the made frame is the clean cross-fade (1 − t)·A + t·B when an endpoint is flat (std under `MFG_FADEFLAT` 0.02), the zone correlation at zero motion is at least `MFG_FADEC` 0.90, or it is a still-picture fade. A hard cut still repeats A; a pair that would be rejected keeps the cross-fade. |
+| `MFG_FBLEND` | 1 | Fade pair that is warped: zones whose change departs from the common relation (a HUD fading in) blend toward the cross-fade, weight ramp `MFG_FADEB0` 0.25 to `MFG_FADEB1` 0.60 on \|Δlog contrast\| + 2·\|Δmean\|. |
+| `MFG_SRC`, `MFG_DUMPSRC` | | v0.8: load the shader source from a file / write it out (fast MSL iteration). `MFG_PSOINFO=1` prints max threads per pipeline. |
 | `MFG_TG` | | Threadgroup shape per kernel for sweeps, e.g. `mfg_anchor=8x8,mfg_upwarp=32x4`. |
 | `MFG_VERBOSE` | 0 | 1 = print shader compile errors. |
 | `FG_DEBUG_VIEW` | 0 | 1 = occlusion map, 2 = horizontal vector, written into the luma plane. |

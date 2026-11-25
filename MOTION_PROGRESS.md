@@ -2,11 +2,12 @@
 
 The engineering log of the [Motion engine](MOTION.md), newest first. Every Motion experiment adds an entry with its numbers.
 
-Motion has its own version number, separate from the FramePortal app it ships in. It keeps the `-beta` tag, and Apple's engine stays the app's default, until Motion is visually clean enough for **v1.0**.
+Motion has its own version number, separate from the FramePortal app it ships in. It keeps the `-beta` tag until Motion is visually clean enough for **v1.0**.
 
 | Motion | Shipped in FramePortal | Summary |
 |---|---|---|
-| **v0.7-beta** | v2.1.0 | Non-blocking admission, clean repeat at hard cuts, true midpoint times, side proof fixes the subtitle square |
+| **v0.8-beta** | v2.1.13 | Fade and exposure guard, fewer GPU drains (−0.6 to −1.1 ms p50, bit-identical), phase-split 4x behind a switch |
+| v0.7-beta | v2.1.0 | Non-blocking admission, clean repeat at hard cuts, true midpoint times, side proof fixes the subtitle square |
 | v0.6-beta | v1.14.0 | Pass 3 on by default and 1.3 ms (p95 3.1 ms) cheaper than v0.5's; pair-local subtitle guard replaces the overlay lock |
 | v0.5-beta | v1.12.0 | Faster pipeline (fused upsample + warp, no CPU waits), occlusion only when proven, soft upsample and per-pixel overlay lock |
 | v0.4-beta | v1.10.0 | Frame-border handling, learned static-HUD mask |
@@ -42,9 +43,118 @@ How the numbers are measured:
 
 ---
 
+## Motion v0.8-beta: fade and exposure guard (2026-11-24)
+
+Based on the v0.8 speedups below (`MFG_PRE`, `MFG_SPLIT`, `MFG_HUDSKIP`, `MFG_REORDER` on). Switches: see the `MFG_FADE` rows in [MOTION.md](MOTION.md). All on by default: they pass the gates.
+
+**Problem (Rec 5, 60 FPS, real and made frames alternating):** Motion assumes constant brightness, and its cut detector only catches hard cuts.
+- Tunnel exit at 58.97 s (a fade in from grey, then exposure rising): dark blotches in the bright tunnel mouth and a shredded minimap fading in.
+- Map close at 195.18 s: the whole map is warped across the fade (the roads vanish, dark blocks at the edges).
+- Rec 6: dark specks on a static map (about 10.9 s) and black blotches on the map-close fade (about 11.0 s).
+- The real frames are clean at all these moments. The bench reproduces every one of them from the real frames alone.
+
+**What it does.** While VideoToolbox searches, the luma relation of the two guides is measured per zone (16×9 zones, every 4th guide px, CPU: about 0.55 ms, overlapped with the search).
+1. **Trigger:** the median zone mean change (over 0.03, and over 0.3 of the picture's std) or the median zone log contrast ratio (over 0.15), with 60 % of the zones agreeing. A still picture (pooled zero-motion correlation of at least 0.97) triggers at 0.01 / 0.04.
+2. **Cross-fade:** an endpoint is flat, the zones still match at zero motion (correlation of at least 0.90), or it is a still-picture fade. The made frame is (1 − t)·A + t·B. A fade to or from a flat picture keeps the cross-fade, although the cut detector calls it a hard cut.
+3. **Otherwise (a moving fade, such as the tunnel exit):** B's guide is normalized to A per zone (gain and offset), the searches are redone on it, and zones that changed their own way (a HUD fading in) blend toward the cross-fade.
+4. **Static picture** (add-on, no fade): when half of the zones did not change, the interior static zones take the A/B blend instead of the warp.
+
+**Gates** (dB: Y / edge / steady; digests vs the v0.8 base):
+
+| Bench | v0.8 base | v0.8 + fade guard | Digest |
+|---|---|---|---|
+| GTA 300 | 29.40 / 26.69 / 25.81 | **29.43 / 26.72 / 25.81** | changed: one pair (117, a big white sign and flash) triggers; the 4 static pairs are identical |
+| Rec 1 @100 s, 300, every pair | 38.06 / 33.57 | 38.06 / 33.57 | identical `fe690cdad934208e` |
+| Rec 7 @2 s (stride 2, 120) | 30.79 / 27.05 | 30.79 / 27.05 | identical |
+| Rec 7 @26 s (a fade) | 31.73 / 24.86 / 28.67 | **32.04 / 24.88 / 28.79** | changed (27 fade pairs) |
+| Rec 7 @52 s (skip 1) | 30.35 / 26.07 | 30.35 / 26.07 | identical |
+| Rec 7 @78 s | 31.54 / 24.83 | 31.54 / 24.83 | identical |
+| Synthetic (pan, object, HUD) | 25.7 / 19.4 dB, 0.00 % HUD | 25.7 / 19.4 dB, 0.00 % HUD | |
+| Rec 5 @58.5 s, stride 2, 40 (fade to grey, tunnel) | 36.16 / 28.19 / 35.21 | **40.22 / 28.97 / 36.72** | (50/50 blend: 35.80) |
+| Rec 5 @194.4 s, stride 2, 40 (map close) | 36.83 / 31.37 / 36.65 | **41.93 / 32.80 / 39.24** | (50/50 blend: 42.21) |
+| Rec 6 @10.8 s, every pair: dark-speck pixels per made frame | 621 / 494 / 2121 / 990 / 2743 / 12060 / 4563 | **0 in all 12 pairs** | |
+
+**Cost** (GTA 300, Motion only, 4 interleaved rounds each, order reversed every other round; mean of the round p50 / p95):
+
+| Build | Made p50 | Made p95 | GPU p50 |
+|---|---|---|---|
+| v2.1.0 | 13.27 ms | 16.21 ms | 9.41 ms |
+| v0.8 base (speedups on) | 12.76 ms | 15.37 ms | 8.96 ms |
+| v0.8 + fade guard | **12.68 ms** | **15.35 ms** | 8.99 ms |
+
+The guard costs nothing measurable on pairs without a fade (−0.08 ms, inside the noise; gate ≤ +0.3 ms). A warped fade pair pays a second VideoToolbox search (about +2.5 ms) and a cross-fade or blend pass. The v0.8 speedups are present and still gain about 0.5 ms p50 over v2.1.0.
+
+**Visual check** (crops: A, recorded made frame or true middle frame, before, after, B): the tunnel exit (blotches and minimap gone), map close at 195.1 / 195.18 s (roads kept, no dark blocks), the Rec 6 static map and its close (no specks or blotches), the scored fade-to-grey and map pairs, and a normal driving pair (identical).
+
+**Still open:**
+- The first pair of a fade-in from flat grey scores lower than the old output (tunnel stride-2 pair 12: 49.6 → 42.6 dB). The true middle frame is still almost flat, and the cross-fade already shows the scene at half strength. It is visually clean.
+- On the map close the cross-fade is still 0.3 dB under the plain 50/50 blend over the whole stretch.
+- Not checked live yet.
+- The trigger thresholds come from four recordings. A slow exposure ramp under 0.15 log contrast per pair, with motion, is not caught; it is left to the normal warp.
+- The car halo is not addressed.
+
+---
+
+
+## Motion v0.8-beta: fewer drains, phase-split 4x (2026-11-24)
+
+Bench clip: the GTA VI recording (300 midpoints, Motion only). Interleaved A/B on the M2, 4 rounds per set, every other round in reversed order. Ranges are [min-max] over the rounds. Runs that overlapped a live stream were stopped and discarded. Other offline benches shared the machine, so single runs vary by about ±0.6 ms p50.
+
+### 60 FPS: what ships on by default
+
+| Switch | Parity (GTA digest) | Frame p50 ms | Frame p95 ms | GPU p50 ms |
+|---|---|---|---|---|
+| v2.1.0 (base), set 1 / set 2 | `2df0f73d39e14499` | 13.46 [13.24-13.50] / 13.71 [12.77-14.06] | 16.23 / 20.18 | 9.56 / 9.82 |
+| v0.8, all switches off | exact | 13.59 [13.24-13.77] / 13.14 [12.54-13.71] | 16.74 / 16.47 | 9.72 / 9.43 |
+| `MFG_PRE` alone | exact | 13.20 [12.37-14.36] | 18.13 | 8.79 |
+| `MFG_SPLIT` alone | exact | 13.26 [12.73-13.85] | 18.51 | 9.37 |
+| `MFG_HUDSKIP` alone | exact | 13.09 [12.59-13.53] | 17.63 | 9.14 |
+| `MFG_REORDER` alone | exact | 13.82 [13.12-14.13] | 18.52 | 10.00 |
+| `MFG_PRE` + `MFG_HUDSKIP` | exact | 12.96 [12.46-13.75] | 17.86 | 8.96 |
+| **All four (new default)**, set 1 / set 2 | exact | **12.89 [12.63-13.83] / 12.61 [12.51-15.13]** | 17.72 / **15.93** | 9.07 / **8.86** |
+
+- **Result:** −0.6 to −1.1 ms p50 and about −0.7 ms GPU p50 against v2.1.0, bit-identical. Quality is unchanged: 29.40 / 26.69 / 25.81 dB on GTA, 38.06 / 33.57 dB on Rec 1 (from 100 s, 300 pairs, every pair; digest `fe690cdad934208e` with and without the four switches), synthetic 26.1 / 19.5 dB with 0.00 % HUD error.
+- **Most of the gain is `MFG_PRE`:** the clears, the subtitle seed pre-test and the anchored search's zero and temporal-seed scores run while VideoToolbox searches.
+- **`MFG_REORDER` alone measured slower** (GPU 10.00 ms), but it helps in combination. It is kept on with the others because the four-switch set is the fastest measured configuration in both sets.
+- **Target missed:** 10.5 / 12.0 ms p50 / p95. The best set is at 12.6 ms p50. About 2.3 ms of that is the VideoToolbox wait and 0.5 ms the guide. The warp (`mfg_upwarp`, 4.4-4.7 ms) is limited by latency and occupancy (768 threads for the glyph kernel), not by texture layout. A plain 2×2 warp kernel takes 0.24 ms.
+
+### 60 FPS: measured, left off
+
+| Switch | Result |
+|---|---|
+| `MFG_AEXIT` (per-row early exit in the anchored match) | Not exact: digest `095f409998635451`. Slower: GPU 10.12 ms. |
+| `MFG_REACH` (P1: measured vertical reach) | Not bit-identical (`011610ab34c63d85`), same dB to 0.01 on GTA and Rec 1, synthetic HUD 0.00 %. With the four switches: 12.79 [12.26-13.57] / 16.11 ms, GPU 8.94: no faster than without it. 4x: 27.02 / 24.46 dB, deterministic (`6bc34c7d4a420fc0` in 4 runs, with and without the four switches). One earlier 4x run with the four switches, under heavy machine load, gave 26.99 / 24.41 dB and one failed pair (`566a07ecb80446ce`, 447 frames); not reproduced, cause unknown. Off until explained and checked live. |
+
+The quality trades from the paused section (`MFG_SUBALL=0`, `MFG_PRING=0`, `MFG_APROP=2 MFG_STEPS=4,1`, `MFG_SOFTC=2`, `MFG_SOFTTOP=2`) all miss the 29.40 / 26.69 / 25.81 dB gate. None ships.
+
+### 120 FPS (4x mode)
+
+150 pairs, 3 rounds: one round before a live stream, two after. Pair = admission → all three phases. First = admission → t = 0.25 delivered.
+
+| Config | 4x digest | Pair p50 ms | Pair p95 ms | GPU p50 ms | First phase p50 / p95 ms |
+|---|---|---|---|---|---|
+| v2.1.0 | (no 4x digest; per-t dB identical) | 26.13 [23.31-26.24] | 33.34 | 20.72 | = pair |
+| v0.8 default | `54c8e3affe6e3de0` | 24.90 [23.40-26.09] | 31.24 | 20.71 | 24.81 / 31.18 |
+| `MFG_PHASE` | exact | **23.48 [22.97-26.01]** | 31.02 | 20.09 | **14.29 / 19.18** |
+| `MFG_SPLAT3` | exact | 26.00 [23.89-27.96] | 32.90 | 21.04 | 25.91 / 32.41 |
+| `MFG_PHASE` + the four switches | exact | 24.48 [23.60-25.56] | 33.13 | 19.67 | 14.43 / 19.53 |
+| `MFG_PHASE` + `MFG_SPLAT3` + the four | exact | 27.84 [25.50-27.90] | 40.27 | 21.64 | 17.23 / 29.91 |
+
+- Every config gives 27.02 / 24.46 dB.
+- **`MFG_PHASE`:** the first made frame arrives about 10 ms earlier (14.3 vs 24.8 ms p50) at no pair cost. It stays **off** until the live 120 Hz check of the phased presentation in the app, which is **pending**.
+- **`MFG_SPLAT3`** (one splat traversal for all phases) is exact but 1-3 ms slower: three splat targets per thread raise register pressure more than the saved traversals gain. Off.
+
+### Not done
+
+- **P1 provenance** (steady / A-only / B-only through the bins): not started.
+- **Live 120 Hz check** of the phase delivery: pending.
+
+---
+
+
 ## Motion v0.7-beta (v2.1.0, 2026-11-24): live admission, cuts, side proof
 
-Inputs: the independent v0.6 audit and the live 720p59.7 recording 10-06-16 (10,025 frames). Bench machine: MacBook Air M2, shared with other GPU work; benches run interleaved, and the run order alone moved p50 by ±0.9 ms.
+Inputs: the independent v0.6 audit and the live 720p59.7 recording Rec 2 (10,025 frames). Bench machine: MacBook Air M2, shared with other GPU work; benches run interleaved, and the run order alone moved p50 by ±0.9 ms.
 
 | | Apple | Motion v0.6-beta | **Motion v0.7-beta** |
 |---|---|---|---|
@@ -55,22 +165,22 @@ Inputs: the independent v0.6 audit and the live 720p59.7 recording 10-06-16 (10,
 | Synthetic Y / object / HUD wrong | 19.6 dB / 26.1 dB / 2.58 % | 26.1 / 19.4 dB / 0.00 % | **26.1 / 19.5 dB / 0.00 %** |
 | 4x per t (0.25 / 0.5 / 0.75), Y dB | | 27.16 / 26.55 / 27.34 | 27.18 / 26.54 / 27.33 |
 | 4x pair p50 / p95, GPU p50 / p95 | | 22.62 / 35.07, 18.41 / 29.15 ms | 20.51 / 30.37, 16.39 / 25.20 ms |
-| 20-55-31 @01:45 (every pair, 300) | | 38.06 / 33.56 dB | 38.06 / 33.57 dB |
-| 10-06-16 replay: cuts / repeats / skips (5296 real pairs) | | 0 / 0 / 1 | 2 / 1 / 0 |
+| Rec 1 @01:45 (every pair, 300) | | 38.06 / 33.56 dB | 38.06 / 33.57 dB |
+| Rec 2 replay: cuts / repeats / skips (5296 real pairs) | | 0 / 0 / 1 | 2 / 1 / 0 |
 
 Cost: no measurable change; the 10.5 / 12.0 ms target is **missed** (see P2).
 
 ### P0: live smoothness
 
 - **Non-blocking admission.** `trySubmit` / `trySubmit4` answer `.busy` at once while a pair holds the engine (the live path shows the real frame instead of waiting up to 250 ms). The pair state (last guide, temporal-seed parity, HUD buffers, pools, a generation id) lives on one serial owner queue; the state flips before the commit, so the completion that releases the slot can never race it. The 250 ms timer is an off-path watchdog: it reports a timeout, resets the seeds and keeps the slot until the GPU work really retires. 30 busy pairs in a row count as one watchdog timeout in the app. Both endpoints are validated, and a failed guide command buffer stops the pair before VideoToolbox.
-- **Hard scene cuts → clean repeat.** Guide texture change ≥ 0.45, histogram distance ≥ 0.45 and ≥ 5 % of cells costing over 0.04: every made frame of the pair is an exact copy of A, seeds reset. Replay of 10-06-16: exactly the two map → menu cuts (107.4 s and 117.9 s, real frames 6407 / 7034); nothing on the GTA clip (max 0.62 / 0.39).
-- **Skipped pairs.** The 572 real → real pairs in 10-06-16 are not rejections: the engine rejects 1 of 5,296 pairs in a faithful replay (43.6 dB agreement with the recorded made frames), and the file has a frame every 10 ticks (16.7 ms) at those places: they are sharp made frames the forensic classifier labelled real. A rejected pair is now a clean repeat of A instead of a skip (`MFG_REJECT=skip` for v0.6).
+- **Hard scene cuts → clean repeat.** Guide texture change ≥ 0.45, histogram distance ≥ 0.45 and ≥ 5 % of cells costing over 0.04: every made frame of the pair is an exact copy of A, seeds reset. Replay of Rec 2: exactly the two map → menu cuts (107.4 s and 117.9 s, real frames 6407 / 7034); nothing on the GTA clip (max 0.62 / 0.39).
+- **Skipped pairs.** The 572 real → real pairs in Rec 2 are not rejections: the engine rejects 1 of 5,296 pairs in a faithful replay (43.6 dB agreement with the recorded made frames), and the file has a frame every 10 ticks (16.7 ms) at those places: they are sharp made frames the forensic classifier labelled real. A rejected pair is now a clean repeat of A instead of a skip (`MFG_REJECT=skip` for v0.6).
 - **True midpoint times.** Made frames are stamped halfway between the two real frames' actual times (they arrive 30-37 ms apart), for display and recording; 4x at t of the actual gap. A fixed "newer − 16.7 ms" could fall before the older frame and be dropped by the recorder.
 
 ### P1: picture
 
-- **Side proof (on).** A proven one-sided cell now carries the cost of the background vector it actually uses (it carried the cheaper rejected vector's cost, so the fade and the soft upsample treated it as a confident match), and the 1-ring pull no longer hands a proven one-sided cell an unproven vector. This removes the 8-px light square left of the first subtitle letter at 20-55-31 @01:45, which was not glyph leakage: it stays with `MFG_HOLE=0`, `MFG_GGROW=0`, `MFG_GLYPH=0`, `MFG_SOFT=0` and the footprint mask, and goes only with the proof. +0.01 dB GTA, +0.1 dB synthetic object.
-- **Footprint mask (`MFG_GFOOT`, off):** no visible change, −0.02 dB on 20-55-31.
+- **Side proof (on).** A proven one-sided cell now carries the cost of the background vector it actually uses (it carried the cheaper rejected vector's cost, so the fade and the soft upsample treated it as a confident match), and the 1-ring pull no longer hands a proven one-sided cell an unproven vector. This removes the 8-px light square left of the first subtitle letter at Rec 1 @01:45, which was not glyph leakage: it stays with `MFG_HOLE=0`, `MFG_GGROW=0`, `MFG_GLYPH=0`, `MFG_SOFT=0` and the footprint mask, and goes only with the proof. +0.01 dB GTA, +0.1 dB synthetic object.
+- **Footprint mask (`MFG_GFOOT`, off):** no visible change, −0.02 dB on Rec 1.
 - **`MFG_SOFTS`:** 0.06 is the value behind the reference triplet; 0.12 gives 29.42 / 26.72 / 25.82 but −0.3 dB on the synthetic object. Unchanged.
 - **x420:** 60 GTA midpoints decoded 10-bit had 146.9 M non-canonical words (all of them); now 0 (+0.01 dB).
 - **Not fixed:** the palm entering at the right edge (153.97 s) is still a semi-transparent smear: an object entering the frame has no match in A, so no vector carries it (the anchored search may not leave the frame). The building patch at 77.5 s and the pillar at 17.75 s look the same as v0.6 in the replay.
@@ -101,7 +211,7 @@ GTA VI clip, 4x bench, 150 pairs (frames i and i+4, scored against the real i+1.
 
 Whole pair (three made frames, 1080p, MacBook Air M2, five runs): p50 20.5-22.1 ms, p95 27.3-29.6 ms; GPU p50 / p95 about 17 / 25 ms. The pair must finish within the 33 ms real-frame period, so the cost guard falls back to 60 FPS when the median over 24 pairs passes 25 ms or 6 pairs pass 30 ms. A first try with 20 / 25 ms tripped within 17-23 pairs on this machine; at 25 / 30 ms the replayed guard does not trip on the GTA clip. 4K would cost about four times as much and is expected to fall back on an M2.
 
-Visual (20-55-31 @01:45, pair 72): the three frames step evenly between A and B, the subtitle stays whole in all three; the small ghost left of the first letter (see v0.6 below) shows at t = 0.25 / 0.5 / 0.75 too.
+Visual (Rec 1 @01:45, pair 72): the three frames step evenly between A and B, the subtitle stays whole in all three; the small ghost left of the first letter (see v0.6 below) shows at t = 0.25 / 0.5 / 0.75 too.
 
 Not checked: live presentation on a 120 Hz display (no session run), recording with 4x on (the recording stays 60 FPS by design).
 
@@ -133,10 +243,10 @@ Gates: Y ≥ 29.36 and edge ≥ 26.62 (the v0.5 P3=7 values minus 0.05) pass. Sy
 
 | Clip | Verdict |
 |---|---|
-| 20-55-31 @01:45, frames 288 / 292 / 296: palm shadows, subtitle, minimap, trunk | Minimap and trunk as clean as P3=7. Subtitle whole, no duplicate line; a faint outline and a 4-px dark square can stay left of the first letter ("I") over the moving shadow, where P3=7 is clean. Palm shadows over road: soft, a few weak cell edges left (P3=7 has slightly fewer). |
-| 20-55-31 @01:15 | Same as P3=7 (35.34 vs 35.38 dB, edge 31.17 vs 31.03). |
-| 18-11-45 @00:20 and @01:25 | Same as P3=7 (35.44 / 35.52 vs 35.45 / 35.50 dB). Wall texture clean. |
-| 17-32-49 @00:40 (roof, marquee) | Same as P3=7 (26.94 vs 26.95 dB). |
+| Rec 1 @01:45, frames 288 / 292 / 296: palm shadows, subtitle, minimap, trunk | Minimap and trunk as clean as P3=7. Subtitle whole, no duplicate line; a faint outline and a 4-px dark square can stay left of the first letter ("I") over the moving shadow, where P3=7 is clean. Palm shadows over road: soft, a few weak cell edges left (P3=7 has slightly fewer). |
+| Rec 1 @01:15 | Same as P3=7 (35.34 vs 35.38 dB, edge 31.17 vs 31.03). |
+| Rec 3 @00:20 and @01:25 | Same as P3=7 (35.44 / 35.52 vs 35.45 / 35.50 dB). Wall texture clean. |
+| Rec 4 @00:40 (roof, marquee) | Same as P3=7 (26.94 vs 26.95 dB). |
 
 ### Still open
 
@@ -179,11 +289,11 @@ GTA reference clip, 300 midpoints:
 Synthetic bench (default): HUD pixels wrong 0.00 %. The interpolated fade cost (bit 2) blurs the synthetic object (−1.7 dB, HUD 0.10 % wrong), so it stays off. The unique-match margin (bit 8) measured worse (28.49 / 25.95) and added blocks on the roof lights, so it stays off. The 1-ring pull costs 0.10 ms. The edge PSNR target of 26.6 was not reached.
 
 Visual checks, real frames fed back in, v0.4 and v0.5 crops side by side with the recorded frame:
-- **20-55-31 @01:45 (priority):** the dark block above the minimap is nearly gone (a faint smudge), the block left of the subtitle is mostly gone, and dark dropout blocks along the bottom edge are fewer. The 8-px stair steps on fast palm shadows remain, and so do the grey blocks on the right-edge trunk. Two frames later both versions are badly broken (subtitle letters missing, text fragments copied below it). **Not clean: reduced, not gone.**
-- **20-55-31 @01:15:** no regression.
-- **18-11-45 @00:20:** left-edge blocks slightly reduced; road patches about the same.
-- **18-11-45 @01:25:** blocks along the minimap's bottom edge slightly reduced, still visible.
-- **17-32-49 @00:40 (roof lights):** the ghost of the fourth light is reduced. In the frame with the largest motion, dark fragments between the lights remain, slightly fewer.
+- **Rec 1 @01:45 (priority):** the dark block above the minimap is nearly gone (a faint smudge), the block left of the subtitle is mostly gone, and dark dropout blocks along the bottom edge are fewer. The 8-px stair steps on fast palm shadows remain, and so do the grey blocks on the right-edge trunk. Two frames later both versions are badly broken (subtitle letters missing, text fragments copied below it). **Not clean: reduced, not gone.**
+- **Rec 1 @01:15:** no regression.
+- **Rec 3 @00:20:** left-edge blocks slightly reduced; road patches about the same.
+- **Rec 3 @01:25:** blocks along the minimap's bottom edge slightly reduced, still visible.
+- **Rec 4 @00:40 (roof lights):** the ghost of the fourth light is reduced. In the frame with the largest motion, dark fragments between the lights remain, slightly fewer.
 
 Open:
 - Fast shadows over road: 8-px stair steps and blocks.
@@ -237,11 +347,11 @@ GTA reference clip, 300 midpoints, interleaved runs on the same (busy) M2, made 
 The soft upsample carries the whole score gain; the lock and the edge fade are what clear the subtitle and edge blocks visually. 19 ms p95 misses the 16.7 ms deadline at 60 FPS, so Pass 3 is off by default in v0.5-beta. Next (v0.6): make the soft upsample and the lock cheaper, then turn Pass 3 on.
 
 Visual checks, real frames fed back in, rows A, live recording, v0.4, v0.5 Pass 2, v0.5 Pass 3, B:
-- **20-55-31 @01:45, frames 288 / 292 / 296 (priority):** the bottom-edge blocks, the stair steps on the palm shadows, the grey blocks on the right-edge trunk and the minimap-edge blocks are gone; the road shadows are soft and continuous. The subtitle is whole in all three frames (the first letter "I" included) and no text is copied below it. Left: a faint smear on the trunk in 292 and soft ghosting on the fastest shadows. **Clean in the checked frames.**
-- **20-55-31 @01:15:** no regression; the subtitle and minimap are clean, the small specks on the dirt from v0.4 / Pass 2 are gone.
-- **18-11-45 @00:20:** no regression; the block patches inside the dark car body are gone.
-- **18-11-45 @01:25:** the blocks along the minimap's bottom edge and right of it are gone; a soft grey smear remains under the minimap, where the frame changes most.
-- **17-32-49 @00:40 (roof lights):** the dark fragments between the lights are gone and the outlines are cleaner than v0.4 and Pass 2. A thin halo stays at the fourth light.
+- **Rec 1 @01:45, frames 288 / 292 / 296 (priority):** the bottom-edge blocks, the stair steps on the palm shadows, the grey blocks on the right-edge trunk and the minimap-edge blocks are gone; the road shadows are soft and continuous. The subtitle is whole in all three frames (the first letter "I" included) and no text is copied below it. Left: a faint smear on the trunk in 292 and soft ghosting on the fastest shadows. **Clean in the checked frames.**
+- **Rec 1 @01:15:** no regression; the subtitle and minimap are clean, the small specks on the dirt from v0.4 / Pass 2 are gone.
+- **Rec 3 @00:20:** no regression; the block patches inside the dark car body are gone.
+- **Rec 3 @01:25:** the blocks along the minimap's bottom edge and right of it are gone; a soft grey smear remains under the minimap, where the frame changes most.
+- **Rec 4 @00:40 (roof lights):** the dark fragments between the lights are gone and the outlines are cleaner than v0.4 and Pass 2. A thin halo stays at the fourth light.
 
 Open:
 - The cost: the soft upsample takes about 3 ms more on the GPU. `MFG_SOFTK=0` saves about 2 ms for −0.15 dB.

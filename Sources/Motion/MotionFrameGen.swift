@@ -23,12 +23,25 @@ public final class MotionInterpolator: @unchecked Sendable {
     }
 
     /// Engine revision (bench header, A/B notes).
-    public static let engineVersion = "0.7-beta"
+    public static let engineVersion = "0.8-beta"
     let size: Size
     let guide: Size
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let psoGuide, psoNeg, psoSelect, psoAnchor, psoAnchorProp, psoSplat, psoUpsample, psoSmooth, psoRefine, psoWarpY, psoWarpC, psoEma, psoUpwarp, psoGridFix, psoGSeed, psoGFinal, psoUpwarpNG, psoGArgs: MTLComputePipelineState
+    /// v0.8: the anchored search and the subtitle seeds split around the motion search (MFG_PRE); 4x splat of all
+    /// three phases in one traversal (MFG_SPLAT3).
+    private let psoAnchorPre, psoAnchorPost, psoGSeedPre, psoGSeedPost: MTLComputePipelineState
+    private let psoSplat3: MTLComputePipelineState?
+    /// Fade guard: B's guide brightness-normalized to A (per zone), and the cross-fade / per-zone blend of the made frame.
+    private let psoLNorm, psoFadeMix: MTLComputePipelineState
+    /// Fade guard scratch: a copy of the warped planes (per-zone blend reads them back), made on first use per format.
+    private var fadeScratch: (y: MTLTexture, c: MTLTexture)?
+    /// MFG_PRE scratch: per field cell and side, the zero and temporal-seed scores (2 float4); per band guide px, the
+    /// subtitle seed pre-test (1 = strokes here). hudAny: per static-HUD buffer, "a cell is masked" (MFG_HUDSKIP).
+    private let aPre: [MTLBuffer], gFlag: MTLBuffer, hudAny: MTLBuffer
+    /// 4x phase split (MFG_PHASE): per phase, its own midpoint grid and grid-fix scratch.
+    private var gridMid4: [MTLTexture] = [], gridFix4: [MTLTexture] = []
     private var cache: CVMetalTextureCache?
     private let session: VTMotionEstimationSession
     private var guidePool: CVPixelBufferPool?
@@ -72,6 +85,8 @@ public final class MotionInterpolator: @unchecked Sendable {
     private(set) var started = false
     /// The last completed pair was a hard scene cut: its made frame is a clean copy of A (no ghost blend).
     public private(set) var lastPairWasCut = false
+    /// Fade guard: the last completed pair was a global fade / exposure change, its made frame a clean cross-fade.
+    public private(set) var lastPairFaded = false
     private var pairs = 0
     /// Pixels (fraction) above the photometric threshold that make a pair be skipped.
     static let rejectFraction: Float = 0.30
@@ -82,6 +97,9 @@ public final class MotionInterpolator: @unchecked Sendable {
     nonisolated(unsafe) static var gpu: [Double] = []
     nonisolated(unsafe) static var profile = ProcessInfo.processInfo.environment["MFG_PROFILE"] == "1"
     nonisolated(unsafe) static var stageMs: [String: [Double]] = [:]
+    /// Bench only (MFG_FIELDDUMP=DIR, with `trace`): per pair, the guides, the raw VideoToolbox fields, the anchored
+    /// fields and the midpoint grid of each made frame to DIR (raw planes + DIR/pairs.csv). Never used live.
+    nonisolated(unsafe) static var fieldDump = ProcessInfo.processInfo.environment["MFG_FIELDDUMP"].flatMap { $0.isEmpty ? nil : $0 }
     /// Bench-only: 1 = occlusion side map, 2 = chosen x vector, in the luma output.
     nonisolated(unsafe) static var debugView: Int32 = 0
     /// Motion block size on the half-res guide: 16×16 (32×32 full-res) or 4×4 (8×8 full-res). VideoToolbox offers
@@ -195,6 +213,30 @@ public final class MotionInterpolator: @unchecked Sendable {
     /// v0.7: 10-bit made frames hold canonical x420 codes (MFG_Q10=0: the raw 16-bit interpolated words of v0.6).
     nonisolated(unsafe) static var quant10 = ProcessInfo.processInfo.environment["MFG_Q10"] != "0"
 
+    // v0.8 speed (P2) and 120 FPS (P3) switches. Each one leaves the made frames bit-identical (checked with
+    // --digest); see MOTION.md for the measured effect.
+    /// Pair work that does not need the motion search (buffer clears, the subtitle seed pre-test, the anchored
+    /// search's zero and temporal-seed scores) runs in its own command buffer while VideoToolbox searches (MFG_PRE).
+    nonisolated(unsafe) static var preVT = ProcessInfo.processInfo.environment["MFG_PRE"] != "0"
+    /// The pair's command buffer is committed right after the anchored search is encoded, the rest follows in a
+    /// second one: the GPU starts while the CPU still encodes (MFG_SPLIT).
+    nonisolated(unsafe) static var splitCommit = ProcessInfo.processInfo.environment["MFG_SPLIT"] != "0"
+    /// Anchored match: exact early exit per row of the window (MFG_AEXIT).
+    nonisolated(unsafe) static var anchorExit = ProcessInfo.processInfo.environment["MFG_AEXIT"] == "1"
+    /// Static-HUD reads skipped while the previous pair's mask holds no masked cell (MFG_HUDSKIP).
+    nonisolated(unsafe) static var hudSkip = ProcessInfo.processInfo.environment["MFG_HUDSKIP"] != "0"
+    /// 4x: one splat traversal per direction for all three phases (MFG_SPLAT3).
+    nonisolated(unsafe) static var splat3 = ProcessInfo.processInfo.environment["MFG_SPLAT3"] == "1"
+    /// 4x: each phase in its own command buffer, delivered as soon as it is done, t = 0.25 first (MFG_PHASE).
+    nonisolated(unsafe) static var phaseSplit = ProcessInfo.processInfo.environment["MFG_PHASE"] == "1"
+    /// Fewer GPU barriers (MFG_REORDER): the subtitle mask is grouped while the fields are splatted, the warp's
+    /// indirect grids and the long-term means update run next to the grid fix, so the warp follows with no extra drain.
+    nonisolated(unsafe) static var reorder = ProcessInfo.processInfo.environment["MFG_REORDER"] != "0"
+    /// Subtitle-guard reach from the measured vertical motion instead of a fixed 48 guide px (MFG_REACH).
+    nonisolated(unsafe) static var measReach = ProcessInfo.processInfo.environment["MFG_REACH"] == "1"
+    /// Bench: MFG_RT (soft-upsample ablations), read once.
+    nonisolated(unsafe) static var rtMode = Int32(ProcessInfo.processInfo.environment["MFG_RT"] ?? "0") ?? 0
+
     static var isSupported: Bool { MTLCreateSystemDefaultDevice() != nil }
     /// The 4x passes need the fused, splatted grid path (the default configuration).
     static var canFourX: Bool { fuse && splat && grid > 1 && refinePasses == 0 && !smooth && debugView == 0 }
@@ -210,7 +252,10 @@ public final class MotionInterpolator: @unchecked Sendable {
         var extraPSO: [(Float, [MTLComputePipelineState])] = []
         do {
             let lopt = MTLCompileOptions(); lopt.preprocessorMacros = ["SOFTN": NSNumber(value: Int(ProcessInfo.processInfo.environment["MFG_SOFTN"] ?? "") ?? 10)]
-            let lib = try dev.makeLibrary(source: Self.shaders, options: lopt)
+            // Bench: MFG_SRC = a shader file to compile instead of the built-in source (MFG_DUMPSRC writes the built-in one).
+            if let p = ProcessInfo.processInfo.environment["MFG_DUMPSRC"] { try? Self.shaders.write(toFile: p, atomically: true, encoding: .utf8) }
+            let src = ProcessInfo.processInfo.environment["MFG_SRC"].flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? Self.shaders
+            let lib = try dev.makeLibrary(source: src, options: lopt)
             let fc = MTLFunctionConstantValues()
             var bo = Self.border
             fc.setConstantValue(&bo, type: .bool, index: 0)
@@ -262,12 +307,19 @@ public final class MotionInterpolator: @unchecked Sendable {
             var tHalf: Float = 0.5, pairWork = true
             fc.setConstantValue(&tHalf, type: .float, index: 44); fc.setConstantValue(&pairWork, type: .bool, index: 45)
             cb(Self.sideProof, 46); cb(env["MFG_GFOOT"] == "1", 47); cb(env["MFG_SELX"] == "1", 48)
+            // v0.8: split phases of the anchored search / subtitle seeds (0 = whole kernel, 1 = before the motion
+            // search, 2 = after it), exact early exit of the anchored match, HUD-read skip; spare bench constants.
+            ci(0, 49); ci(0, 50); cb(Self.anchorExit, 51); cb(Self.hudSkip, 52)
+            for k in 53...56 { cb(env["MFG_X\(k)"] == "1", k) }
+            cf(ef("MFG_XF57", 0), 57); cb(Self.measReach, 58)
             func pso(_ n: String) throws -> MTLComputePipelineState {
                 let p = try dev.makeComputePipelineState(function: lib.makeFunction(name: n, constantValues: fc))
                 if let t = tgEnv[n] ?? Self.defaultTG[n] { tgs[ObjectIdentifier(p)] = t }
+                if env["MFG_PSOINFO"] == "1" { print("pso \(n): maxThreads \(p.maxTotalThreadsPerThreadgroup), simd \(p.threadExecutionWidth), static tg mem \(p.staticThreadgroupMemoryLength)") }
                 return p
             }
             psoGuide = try pso("mfg_guide"); psoNeg = try pso("mfg_neg"); psoSelect = try pso("mfg_select"); psoAnchor = try pso("mfg_anchor"); psoUpsample = try pso("mfg_upsample"); psoAnchorProp = try pso("mfg_anchor_prop"); psoSplat = try pso("mfg_splat"); psoSmooth = try pso("mfg_smooth"); psoRefine = try pso("mfg_refine"); psoWarpY = try pso("mfg_warp_y"); psoWarpC = try pso("mfg_warp_c"); psoEma = try pso("mfg_ema"); psoUpwarp = try pso("mfg_upwarp"); psoGridFix = try pso("mfg_gridfix"); psoGSeed = try pso("mfg_gseed"); psoGFinal = try pso("mfg_gfinal"); psoGArgs = try pso("mfg_gargs")
+            psoLNorm = try pso("mfg_lnorm"); psoFadeMix = try pso("mfg_fademix")
             var ng = true; fc.setConstantValue(&ng, type: .bool, index: 41)
             psoUpwarpNG = try pso("mfg_upwarp")
             if fourX && Self.canFourX {
@@ -279,7 +331,20 @@ public final class MotionInterpolator: @unchecked Sendable {
                     g = true; fc.setConstantValue(&g, type: .bool, index: 41)
                     extraPSO.append((t, k + [try pso("mfg_upwarp")]))
                 }
-            }
+                var th: Float = 0.5, pw = true, g = false
+                fc.setConstantValue(&th, type: .float, index: 44); fc.setConstantValue(&pw, type: .bool, index: 45)
+                fc.setConstantValue(&g, type: .bool, index: 41)
+                psoSplat3 = try pso("mfg_splat3")
+            } else { psoSplat3 = nil }
+            // Before / after the motion search (MFG_PRE): the same kernels, split.
+            var tHalf2: Float = 0.5, pairWork2 = true, ng2 = false
+            fc.setConstantValue(&tHalf2, type: .float, index: 44); fc.setConstantValue(&pairWork2, type: .bool, index: 45)
+            fc.setConstantValue(&ng2, type: .bool, index: 41)
+            ci(1, 49); ci(1, 50)
+            psoAnchorPre = try pso("mfg_anchor"); psoGSeedPre = try pso("mfg_gseed")
+            ci(2, 49); ci(2, 50)
+            psoAnchorPost = try pso("mfg_anchor"); psoGSeedPost = try pso("mfg_gseed")
+            ci(0, 49); ci(0, 50)
             session = try VTMotionEstimationSession(width: UInt32(guide.width), height: UInt32(guide.height),
                                                     motionVectorSize: Self.smallBlocks ? .blockSize4x4 : .blockSize16x16, useMultiPassSearch: Self.multiPass, label: "Motion")
             tg = tgs
@@ -313,6 +378,11 @@ public final class MotionInterpolator: @unchecked Sendable {
               let h2 = dev.makeBuffer(length: guide.width * guide.height * 8, options: .storageModePrivate),
               let em = dev.makeBuffer(length: guide.width * guide.height * 8, options: .storageModePrivate) else { return nil }
         fAs = [a1, a6]; fBs = [a2, a7]; fTmp = a3; fTmpB = a5; gridMid = a4; gridFix = a8; gridAlt = a9; splatA = s1; splatB = s2; hudS = [h1, h2]; emaBuf = em
+        guard let p1 = dev.makeBuffer(length: gridSize.width * gridSize.height * 32, options: .storageModePrivate),
+              let p2 = dev.makeBuffer(length: gridSize.width * gridSize.height * 32, options: .storageModePrivate),
+              let gfl = dev.makeBuffer(length: max(16, guide.width * Int(band.y - band.x)), options: .storageModePrivate),
+              let ha = dev.makeBuffer(length: 16, options: .storageModePrivate) else { return nil }
+        aPre = [p1, p2]; gFlag = gfl; hudAny = ha
         let mid = TPass(t: 0.5, splat: psoSplat, select: psoSelect, gridFix: psoGridFix, upwarp: psoUpwarp, upwarpNG: psoUpwarpNG, spA: s1, spB: s2)
         pass1 = [mid]
         if extraPSO.count == 2 {
@@ -322,6 +392,11 @@ public final class MotionInterpolator: @unchecked Sendable {
                 q.append(TPass(t: t, splat: k[0], select: k[1], gridFix: k[2], upwarp: k[3], upwarpNG: k[4], spA: a, spB: b))
             }
             pass4 = [q[0], mid, q[1]]
+            // Phase split: the t = 0.5 grid stays alive while the t = 0.25 phase runs (own scratch per phase).
+            for _ in 0..<2 {
+                guard let x = dev.makeTexture(descriptor: gd), let y = dev.makeTexture(descriptor: gd) else { return nil }
+                gridMid4.append(x); gridFix4.append(y)
+            }
         }
         CVMetalTextureCacheCreate(nil, nil, dev, nil, &cache)
     }
@@ -377,18 +452,25 @@ public final class MotionInterpolator: @unchecked Sendable {
     public func interpolate4(prev: CVPixelBuffer, cur: CVPixelBuffer, completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
         if trySubmit4(prev: prev, cur: cur, completion: completion) == .busy { completion(nil, Self.busyError) }
     }
-    public func trySubmit4(prev: CVPixelBuffer, cur: CVPixelBuffer, completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) -> Admission {
+    /// `onPhase` (v0.8, MFG_PHASE): each made frame as soon as it is done, in order (index 0 = t 0.25), before the
+    /// completion; not called for a skipped or failed pair. Without the phase split all three arrive together.
+    public func trySubmit4(prev: CVPixelBuffer, cur: CVPixelBuffer, onPhase: (@Sendable (Int, CVPixelBuffer) -> Void)? = nil,
+                           completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) -> Admission {
         guard let p4 = pass4 else { completion(nil, Self.err("4x passes not built")); return .accepted }
-        return submit(prev: prev, cur: cur, passes: p4, completion: completion)
+        return submit(prev: prev, cur: cur, passes: p4, onPhase: onPhase, completion: completion)
     }
+    /// True when 4x phases are delivered one by one (`onPhase` before the completion).
+    public var phasesSplit: Bool { pass4 != nil && Self.phaseSplit && !Self.profile && gridMid4.count == 2 }
 
     public static let busyError = NSError(domain: "Motion", code: 3, userInfo: [NSLocalizedDescriptionKey: "previous pair still running"])
     public static func isBusy(_ e: Error?) -> Bool { (e as NSError?).map { $0.domain == "Motion" && $0.code == 3 } ?? false }
 
-    private func submit(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) -> Admission {
+    private func submit(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], onPhase: (@Sendable (Int, CVPixelBuffer) -> Void)? = nil,
+                        completion: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) -> Admission {
         guard inflight.wait(timeout: .now()) == .success else { return .busy }
         let tIn = CACurrentMediaTime()
         let j = Job(prev: prev, cur: cur, passes: passes, done: completion)
+        j.onPhase = onPhase; j.tIn = tIn
         // The slot is released only when the pair's work has really finished (GPU retired or never started).
         j.release = { [inflight] in inflight.signal() }
         owner.async { [self] in
@@ -418,6 +500,7 @@ public final class MotionInterpolator: @unchecked Sendable {
         if outPool == nil || outFormat != fmt { outPool = Self.pool(fmt, size); outFormat = fmt }
         guard let outPool else { return j.finish(nil, Self.err("output pool")) }
         pairs &+= 1
+        j.index = pairs - 1
         if pairs % 120 == 0 { CVMetalTextureCacheFlush(cache, 0) }   // drop stale plane textures (footprint)
         let yFmt: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm, cFmt: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
 
@@ -436,12 +519,14 @@ public final class MotionInterpolator: @unchecked Sendable {
         if let l = last, l.pb === prev { gA = l.guide } else if let g = makeGuide(prev) { gA = g } else { return j.finish(nil, Self.err("guide")) }
         guard let gB = makeGuide(cur) else { return j.finish(nil, Self.err("guide")) }
         last = (cur, gB)
+        if Self.trace && Self.fieldDump != nil { j.gpbA = gA; j.gpbB = gB }
         let tg0 = CACurrentMediaTime()
         if Self.trace { Self.stageMs["cpu.pre", default: []].append((tg0 - tIn) * 1000) }
 
         // Once the guides are done, both motion searches run (concurrently); the pair continues on the owner queue
         // when they and the frame textures below are ready, on whichever side gets there last.
         let ses = session
+        nonisolated(unsafe) let ugA = gA, ugB = gB                    // read-only guides for the detached task
         let ra = CVReadOnlyPixelBuffer(unsafeBuffer: gA), rb = CVReadOnlyPixelBuffer(unsafeBuffer: gB)
         cmd0.addCompletedHandler { [self] cb in
             let tg1 = CACurrentMediaTime()
@@ -451,19 +536,37 @@ public final class MotionInterpolator: @unchecked Sendable {
                 return
             }
             Task.detached(priority: .userInitiated) { [self] in
-                do {
+                // Fade guard (MFG_FADE): the A/B luma relation is measured while the searches run (off the critical
+                // path). On a fade or an exposure change that is warped, the searches are redone with B's guide
+                // normalized to A's brightness, zone by zone (fade pairs only).
+                func plan() {
+                    guard Self.fade else { return }
+                    let ts = CACurrentMediaTime()
+                    let p = Self.fadePlan(Self.lumaRelation(ugA, ugB))
+                    if Self.trace { let d = (CACurrentMediaTime() - ts) * 1000; owner.async { Self.stageMs["cpu.fade", default: []].append(d) } }
+                    j.fade = p
+                    if Self.fadeLog && p.trigger { print(p.log) }
+                }
+                func search(_ rb: CVReadOnlyPixelBuffer, first: Bool) async throws {
                     if !Self.bothVT {                                       // one search; A -> B candidates = -vB
                         async let fB = ses.motion(of: rb, comparedTo: ra)
-                        j.cut = Self.cutScore(gA, gB)                       // while the search runs
+                        if first { j.cut = Self.cutScore(ugA, ugB); plan() }  // while the search runs
                         let mb = try await fB
                         mb.motionVector.withUnsafeBuffer { j.vB = $0 }
                     } else {
                         async let fB = ses.motion(of: rb, comparedTo: ra)   // B(p) ≈ A(p + vB)
                         async let fA = ses.motion(of: ra, comparedTo: rb)   // A(p) ≈ B(p + vA)
-                        j.cut = Self.cutScore(gA, gB)                       // while the searches run
+                        if first { j.cut = Self.cutScore(ugA, ugB); plan() }  // while the searches run
                         let (mb, ma) = try await (fB, fA)
                         mb.motionVector.withUnsafeBuffer { j.vB = $0 }
                         ma.motionVector.withUnsafeBuffer { j.vA = $0 }
+                    }
+                }
+                do {
+                    try await search(rb, first: true)
+                    if let p = j.fade, p.trigger && !p.whole && Self.fadeNorm, let gn = await normalizeGuide(gB, p) {
+                        j.gbN = gn
+                        try await search(CVReadOnlyPixelBuffer(unsafeBuffer: gn), first: false)
                     }
                 } catch { j.error = error }
                 let tm1 = CACurrentMediaTime()
@@ -483,6 +586,8 @@ public final class MotionInterpolator: @unchecked Sendable {
         if j.outs.count == j.passes.count {
             j.ga = guideTex(j, gA); j.gb = guideTex(j, gB)
             j.yA = tex(j, prev, 0, yFmt); j.cA = tex(j, prev, 1, cFmt); j.yB = tex(j, cur, 0, yFmt); j.cB = tex(j, cur, 1, cFmt)
+            // MFG_PRE: what does not need the motion fields runs on the GPU while VideoToolbox searches.
+            if Self.preVT && !Self.profile && Self.splat && Self.grid > 1 { j.pre = encodePre(j) }
         }
         if j.arrive() { run(j) }
     }
@@ -502,7 +607,17 @@ public final class MotionInterpolator: @unchecked Sendable {
         var cut = SIMD2<Float>(0, 0)
         var outs: [CVPixelBuffer] = []
         var yOs: [MTLTexture] = [], cOs: [MTLTexture] = []
+        /// v0.8: admission time, the before-search command buffer ran (MFG_PRE), the pair's outcome and first error
+        /// (set by the first completed command buffer), the per-phase delivery (MFG_PHASE).
+        var tIn: CFTimeInterval = 0, pre = false, outcome: PairOutcome = .made, failed: Error?
+        var onPhase: (@Sendable (Int, CVPixelBuffer) -> Void)?
         var ga, gb, yA, cA, yB, cB: MTLTexture?
+        /// MFG_FIELDDUMP: the pair's index (0 = first pair since init) and its guide buffers.
+        var index = 0
+        var gpbA, gpbB: CVPixelBuffer?
+        /// Fade guard: the pair's brightness plan (set before the motion search) and B's normalized guide, if any.
+        var fade: FadePlan?
+        var gbN: CVPixelBuffer?
         private var pending = 2, delivered = false, isRetired = false
         private let lock = NSLock()
         init(prev: CVPixelBuffer, cur: CVPixelBuffer, passes: [TPass], done: @escaping @Sendable ([CVPixelBuffer]?, Error?) -> Void) {
@@ -515,6 +630,11 @@ public final class MotionInterpolator: @unchecked Sendable {
         func deliver(_ pbs: [CVPixelBuffer]?, _ e: Error?) {
             lock.lock(); let first = !delivered; delivered = true; lock.unlock()
             if first { done(pbs, e) }
+        }
+        /// One made frame of a 4x pair, ahead of the completion (dropped once a result went out, e.g. a timeout).
+        func phase(_ k: Int, _ pb: CVPixelBuffer) {
+            lock.lock(); let live = !delivered; lock.unlock()
+            if live { onPhase?(k, pb) }
         }
         /// The work is over: release the slot first (state is already published), then deliver.
         func finish(_ pbs: [CVPixelBuffer]?, _ e: Error?) {
@@ -544,6 +664,61 @@ public final class MotionInterpolator: @unchecked Sendable {
         return CVMetalTextureGetTexture(t)
     }
 
+    /// Blit clears of a pair (splat buffers, subtitle bins, static-HUD state on a reset, the HUD-masked flag of the
+    /// buffer this pair's selection writes).
+    private func encodeFills(_ cmd: MTLCommandBuffer, _ j: Job, _ glyph: Bool) {
+        guard let bl = cmd.makeBlitCommandEncoder() else { return }
+        if Self.splat { for tp in j.passes { bl.fill(buffer: tp.spA, range: 0..<tp.spA.length, value: 0); bl.fill(buffer: tp.spB, range: 0..<tp.spB.length, value: 0) } }
+        if glyph { bl.fill(buffer: gBins, range: 0..<gBins.length, value: 0); bl.fill(buffer: gAny, range: 0..<16, value: 0); bl.fill(buffer: gAny, range: 4..<8, value: 0xFF) }
+        if hudClear { for b in hudS { bl.fill(buffer: b, range: 0..<b.length, value: 0) }; bl.fill(buffer: hudAny, range: 0..<16, value: 0) }
+        else { bl.fill(buffer: hudAny, range: (1 - hudPar) * 4..<(2 - hudPar) * 4, value: 0) }
+        bl.endEncoding()
+    }
+
+    /// MFG_PRE: the pair work that does not need the motion fields, committed while VideoToolbox searches: the
+    /// clears, the subtitle seed pre-test, and the anchored search's zero-vector and temporal-seed scores (the same
+    /// arithmetic as the whole kernel; the after-search kernels read them back in the original candidate order).
+    private func encodePre(_ j: Job) -> Bool {
+        guard let ga = j.ga, let gb = j.gb, let yA = j.yA, let yB = j.yB, let cmd = queue.makeCommandBuffer() else { return false }
+        let glyph = (Self.p3 & 2) != 0 && band.y > band.x
+        encodeFills(cmd, j, glyph)
+        guard let e = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else { return false }
+        if glyph {
+            var bandRows = band, blkG = SIMD2<Float>(16, 16)
+            e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(ga, index: 2); e.setTexture(gSeed, index: 3)
+            e.setTexture(ga, index: 4); e.setTexture(gb, index: 5)
+            e.setBuffer(gBins, offset: 0, index: 0); e.setBytes(&bandRows, length: 8, index: 1); e.setBytes(&blkG, length: 8, index: 2)
+            e.setBuffer(gFlag, offset: 0, index: 3)
+            dispatch(e, psoGSeedPre, Size(guide.width, Int(band.y - band.x)))
+        }
+        let po = 1 - par
+        let G = Float(Self.grid)
+        let sides: [(S: MTLTexture, D: MTLTexture, ps: MTLTexture, po: MTLTexture, k: Int)] =
+            [(ga, gb, fAs[po], fBs[po], 0), (gb, ga, fBs[po], fAs[po], 1)].filter { !(Self.oneSide && $0.k == 0) }
+        for sd in sides {
+            var ap = AnchorParams(blk: SIMD2(16, 16), glob: .zero, lam: Self.lambda, step: 0, g: G)
+            ap.temporal = hasPrev && Self.temporalSeed ? 1 : 0
+            e.setTexture(sd.S, index: 0); e.setTexture(sd.D, index: 1); e.setTexture(sd.S, index: 2); e.setTexture(sd.S, index: 3)
+            e.setTexture(fTmp, index: 4); e.setTexture(sd.ps, index: 5); e.setTexture(sd.po, index: 6)
+            e.setBytes(&ap, length: MemoryLayout<AnchorParams>.stride, index: 0); e.setBuffer(aPre[sd.k], offset: 0, index: 1)
+            let t = tg[ObjectIdentifier(psoAnchorPre)] ?? MTLSize(width: 16, height: 16, depth: 1)
+            e.setThreadgroupMemoryLength((t.width * t.height * 22 * 4 + 15) / 16 * 16, index: 0)
+            dispatch(e, psoAnchorPre, gridSize)
+        }
+        e.endEncoding()
+        cmd.addCompletedHandler { _ in _ = j.keep }
+        cmd.commit()
+        return true
+    }
+
+    /// Completion order of a pair's command buffers (MFG_PHASE: one per phase): handler k runs after handler k - 1.
+    private final class Steps: @unchecked Sendable {
+        let s: [DispatchSemaphore]
+        init(_ n: Int) { s = (0..<n).map { _ in DispatchSemaphore(value: 0) } }
+        func wait(_ k: Int) { if k > 0 { _ = s[k - 1].wait(timeout: .now() + 2) } }
+        func done(_ k: Int) { s[k].signal() }
+    }
+
     /// Second half of a pair: both motion fields are in. Encodes and commits the GPU passes.
     private func run(_ j: Job) {
         let tm1 = CACurrentMediaTime()
@@ -551,18 +726,21 @@ public final class MotionInterpolator: @unchecked Sendable {
         guard j.gen == generation else { return j.finish(nil, Self.err("stale pair")) }   // ended / timed out meanwhile
         guard let vBpb = j.vB else { return j.finish(nil, j.error ?? Self.err("motion")) }
         let vApb = j.vA
-        guard j.outs.count == j.passes.count, let ga = j.ga, let gb = j.gb,
+        guard j.outs.count == j.passes.count, let ga = j.ga, let gbRaw = j.gb,
               let vb = tex(j, vBpb, 0, .rg16Float), let va = vApb.flatMap({ tex(j, $0, 0, .rg16Float) }) ?? negField(vb.width, vb.height),
               let yA = j.yA, let cA = j.cA, let yB = j.yB, let cB = j.cB,
               var cmd = queue.makeCommandBuffer()
         else { return j.finish(nil, Self.err("textures")) }
         let glyph = (Self.p3 & 2) != 0 && band.y > band.x
-        if Self.splat || hudClear || glyph, let bl = cmd.makeBlitCommandEncoder() {
-            if Self.splat { for tp in j.passes { bl.fill(buffer: tp.spA, range: 0..<tp.spA.length, value: 0); bl.fill(buffer: tp.spB, range: 0..<tp.spB.length, value: 0) } }
-            if glyph { bl.fill(buffer: gBins, range: 0..<gBins.length, value: 0); bl.fill(buffer: gAny, range: 0..<16, value: 0); bl.fill(buffer: gAny, range: 4..<8, value: 0xFF) }
-            if hudClear { for b in hudS { bl.fill(buffer: b, range: 0..<b.length, value: 0) } }
-            bl.endEncoding()
-        }
+        // Fade guard: B's normalized guide for every cost below (the long-term HUD means keep the raw one); the
+        // before-search work used the raw guide, so it is redone here.
+        let gbN = j.gbN.flatMap { guideTex(j, $0) }
+        let gb = gbN ?? gbRaw
+        let pre = j.pre && gbN == nil
+        let fadePlan = j.fade.flatMap { $0.trigger || $0.staticOnly ? $0 : nil }
+        let fadeWhole = fadePlan.map { $0.trigger && $0.whole && Self.fadeXF } ?? false
+        let fadeW: [Float]? = fadeWhole ? nil : fadePlan.flatMap { ($0.staticOnly || Self.fadeBlend) && $0.anyBlend ? $0.w : nil }
+        if !pre { encodeFills(cmd, j, glyph) }
         var hudOn: Int32 = Self.hud ? (Self.debugView == 1 ? (ProcessInfo.processInfo.environment["MFG_HUDDBG"] == "1" ? 3 : 2) : 1) : 0
         if hudClear { hudPairs = 0 }
         hudPairs += 1
@@ -570,13 +748,22 @@ public final class MotionInterpolator: @unchecked Sendable {
         // One concurrent encoder: independent dispatches (the A and B sides) overlap, barriers mark the dependencies.
         guard var e = cmd.makeComputeCommandEncoder(dispatchType: .concurrent) else { return j.finish(nil, Self.err("encoder")) }
         func barrier() { e.memoryBarrier(scope: [.textures, .buffers]) }
+        let prof = Self.profile
         // Bench profiling (MFG_PROFILE=1): each stage in its own command buffer, GPU ms per stage.
         func cut(_ name: String) {
-            guard Self.profile else { return barrier() }
+            guard prof else { return barrier() }
             e.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
             Self.stageMs[name, default: []].append((cmd.gpuEndTime - cmd.gpuStartTime) * 1000)
             cmd = queue.makeCommandBuffer()!; e = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)!
         }
+        /// A finished command buffer of this pair and the next one (MFG_SPLIT / MFG_PHASE).
+        func nextBuffer() -> Bool {
+            e.endEncoding()
+            guard let c = queue.makeCommandBuffer(), let ne = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { return false }
+            cmd = c; e = ne
+            return true
+        }
+        var early: MTLCommandBuffer?                       // MFG_SPLIT: the anchored search, committed at once
         if vApb == nil {
             e.setTexture(vb, index: 0); e.setTexture(va, index: 1)
             dispatch(e, psoNeg, Size(vb.width, vb.height))
@@ -591,13 +778,45 @@ public final class MotionInterpolator: @unchecked Sendable {
             e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(vb, index: 2); e.setTexture(gSeed, index: 3)
             e.setTexture(ga, index: 4); e.setTexture(gb, index: 5)
             e.setBuffer(gBins, offset: 0, index: 0); e.setBytes(&bandRows, length: 8, index: 1); e.setBytes(&blkG, length: 8, index: 2)
-            dispatch(e, psoGSeed, Size(guide.width, Int(band.y - band.x)))
-            if Self.profile { cut("glyph") }
+            e.setBuffer(gFlag, offset: 0, index: 3)
+            dispatch(e, pre ? psoGSeedPost : psoGSeed, Size(guide.width, Int(band.y - band.x)))
+            if prof { cut("glyph") }
         }
         if Self.trace { Self.lastField = Size(vb.width, vb.height) }
         var blk = SIMD2<Float>(Float(guide.width) / Float(vb.width), Float(guide.height) / Float(vb.height))   // guide px per vector cell
         let fs = Self.fieldStats(vBpb, &medX, &medY)
         var glob = fs.median
+        // Bench (MFG_FIELDDUMP): guides and raw VideoToolbox fields now (CPU), GPU fields copied out in the encoding
+        // order (each made frame's midpoint grid right after its selection, before a later phase reuses the scratch)
+        // and written by the last completion. Off: nothing below runs and the encoding is unchanged.
+        let dumpDir = Self.trace ? Self.fieldDump : nil
+        var dumpBufs: [(path: String, buf: MTLBuffer)] = []
+        if let dir = dumpDir {
+            for (n, pb) in [("gA", j.gpbA), ("gB", j.gpbB), ("vB", Optional(vBpb)), ("vA", vApb)] {
+                guard let pb else { continue }
+                let g = n.hasPrefix("g")
+                Self.dumpPlane(pb, bytesPerPx: g ? 1 : 4, to: String(format: "%@/%05d-%@-%dx%d.%@", dir, j.index, n,
+                               CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), g ? "u8" : "f16"))
+            }
+        }
+        /// MFG_FIELDDUMP: an rgba16Float texture into a shared buffer (rows packed), in the command order.
+        func dumpCopy(_ t: MTLTexture, _ name: String) {
+            guard let dir = dumpDir, t.pixelFormat == .rgba16Float,
+                  let b = device.makeBuffer(length: t.width * t.height * 8, options: .storageModeShared) else { return }
+            e.endEncoding()
+            if let bl = cmd.makeBlitCommandEncoder() {
+                bl.copy(from: t, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: t.width, height: t.height, depth: 1),
+                        to: b, destinationOffset: 0, destinationBytesPerRow: t.width * 8, destinationBytesPerImage: t.width * t.height * 8)
+                bl.endEncoding()
+                dumpBufs.append((String(format: "%@/%05d-%@-%dx%d.h4", dir, j.index, name, t.width, t.height), b))
+            }
+            e = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)!
+        }
+        func dumpSel(_ tp: TPass, _ s: MTLTexture) {
+            guard dumpDir != nil else { return }
+            if dumpBufs.isEmpty && Self.splat { dumpCopy(fA, "fA"); dumpCopy(fB, "fB") }
+            dumpCopy(s, tp.t == 0.5 ? "mid" : String(format: "mid%03d", Int((tp.t * 100).rounded())))
+        }
         // A still camera makes the whole scene "static": the HUD evidence holds until the picture moves again.
         if hudOn != 0 && fs.level < 1.5 { hudOn |= 8 }
         var opt = SIMD2<Int32>(Self.candRadius, Self.wideSAD)
@@ -617,10 +836,15 @@ public final class MotionInterpolator: @unchecked Sendable {
                 e.setTexture(sd.sgn < 0 ? fAs[po] : fBs[po], index: 5); e.setTexture(sd.sgn < 0 ? fBs[po] : fAs[po], index: 6)
                 e.setTexture(sd.S, index: 0); e.setTexture(sd.D, index: 1); e.setTexture(sd.vs, index: 2); e.setTexture(sd.vd, index: 3)
                 e.setTexture(n % 2 == 1 ? sd.T : sd.F, index: 4)
-                e.setBytes(&ap, length: MemoryLayout<AnchorParams>.stride, index: 0)
+                e.setBytes(&ap, length: MemoryLayout<AnchorParams>.stride, index: 0); e.setBuffer(aPre[sd.sgn < 0 ? 0 : 1], offset: 0, index: 1)
                 let t = tg[ObjectIdentifier(psoAnchor)] ?? MTLSize(width: 16, height: 16, depth: 1)
                 e.setThreadgroupMemoryLength((t.width * t.height * 22 * 4 + 15) / 16 * 16, index: 0)
-                dispatch(e, psoAnchor, gridSize)
+                dispatch(e, pre ? psoAnchorPost : psoAnchor, gridSize)
+            }
+            if Self.splitCommit && !prof {
+                let c0 = cmd
+                guard nextBuffer() else { return j.finish(nil, Self.err("command buffer")) }
+                c0.commit(); early = c0
             }
             for k in 0..<n {
                 cut(k == 0 ? "anchor0" : "anchorP")
@@ -635,54 +859,94 @@ public final class MotionInterpolator: @unchecked Sendable {
             cut(n == 0 ? "anchor0" : "anchorP")
             splatSides = sides.map { ($0.F, $0.sgn) }
         }
-        // One pass per made frame (t = 0.5 alone at 60 FPS; 0.25, 0.5, 0.75 in the 4x mode).
-        for (pi, tp) in j.passes.enumerated() {
-        let yO = j.yOs[pi], cO = j.cOs[pi]
-        if pi > 0 { barrier() }
-        if Self.splat {
+        var fb = Self.fallback
+        func splatPass(_ tp: TPass) {
             for sd in splatSides {
                 var spp = SIMD4<Float>(glob.x, glob.y, sd.sgn, Self.splatMaxCost)
                 e.setTexture(sd.F, index: 0); e.setBuffer(sd.sgn < 0 ? tp.spA : tp.spB, offset: 0, index: 0); e.setBytes(&spp, length: 16, index: 1)
                 e.setBytes(&G, length: 4, index: 2)
                 e.setTexture(sd.F === fA ? fB : fA, index: 1)
                 e.setBuffer(hudS[hudPar], offset: 0, index: 3); e.setBytes(&hudOn, length: 4, index: 4)
+                e.setBuffer(hudAny, offset: hudPar * 4, index: 5); e.setBuffer(gAny, offset: 12, index: 8)
                 dispatch(e, tp.splat, gridSize)
             }
             cut("splat")
         }
-        let selSize = Self.splat ? gridSize : guide
-        var selOut = Self.splat && Self.grid > 1 ? gridMid : midTex
-        e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(vb, index: 2); e.setTexture(va, index: 3)
-        e.setTexture(selOut, index: 4)
-        e.setBytes(&blk, length: 8, index: 0)
-        e.setBuffer(badCount, offset: 0, index: 1)
-        var spOn = SIMD4<Float>(Self.splat ? 1 : 0, 0, Self.splat ? G : 1, Self.splatHard)
-        e.setTexture(fA, index: 5); e.setTexture(fB, index: 6)
-        e.setBuffer(tp.spA, offset: 0, index: 5); e.setBuffer(tp.spB, offset: 0, index: 6); e.setBytes(&spOn, length: 16, index: 7)
-        e.setBytes(&glob, length: 8, index: 2)
-        e.setBytes(&opt, length: 8, index: 3)
-        e.setBytes(&lam, length: 4, index: 4)
-        e.setBuffer(hudS[hudPar], offset: 0, index: 8); e.setBuffer(hudS[1 - hudPar], offset: 0, index: 9); e.setBytes(&hudOn, length: 4, index: 10)
-        e.setBuffer(emaBuf, offset: 0, index: 11)
-        e.setTexture(gridAlt, index: 7)
-        dispatch(e, tp.select, selSize)
-        if selOut === gridMid && ((Self.p2 & 64) != 0 || (Self.p3 & 8) != 0) {
-            cut("select")
-            var th = SIMD2<Float>(Self.holeCost, 0.06)
-            e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(gridMid, index: 2); e.setTexture(gridFix, index: 3)
-            e.setTexture(fA, index: 4); e.setTexture(fB, index: 5)
-            e.setBytes(&G, length: 4, index: 0); e.setBuffer(hudS[hudPar], offset: 0, index: 1); e.setBytes(&hudOn, length: 4, index: 2)
-            e.setBytes(&th, length: 8, index: 3)
-            dispatch(e, tp.gridFix, gridSize)
-            selOut = gridFix
+        // 4x (MFG_SPLAT3): both fields splatted to all three phases in one traversal each.
+        func splat3Pass(_ ps: [TPass], _ k3: MTLComputePipelineState) {
+            for sd in splatSides {
+                var spp = SIMD4<Float>(glob.x, glob.y, sd.sgn, Self.splatMaxCost)
+                e.setTexture(sd.F, index: 0); e.setBytes(&spp, length: 16, index: 1); e.setBytes(&G, length: 4, index: 2)
+                e.setTexture(sd.F === fA ? fB : fA, index: 1)
+                e.setBuffer(hudS[hudPar], offset: 0, index: 3); e.setBytes(&hudOn, length: 4, index: 4)
+                e.setBuffer(hudAny, offset: hudPar * 4, index: 5)
+                for (i, ix) in [0, 6, 7].enumerated() { e.setBuffer(sd.sgn < 0 ? ps[i].spA : ps[i].spB, offset: 0, index: ix) }
+                e.setBuffer(gAny, offset: 12, index: 8)
+                dispatch(e, k3, gridSize)
+            }
+            cut("splat")
         }
-        if glyph && pi == 0 {                            // grouped, grown glyph mask (seeds written long before)
+        /// Selection (and grid fix) of one made frame into the grid scratch gm / gx; returns the field the warp reads.
+        func selectPass(_ tp: TPass, _ gm: MTLTexture, _ gx: MTLTexture, after: (() -> Void)? = nil) -> MTLTexture {
+            let selSize = Self.splat ? gridSize : guide
+            var selOut = Self.splat && Self.grid > 1 ? gm : midTex
+            e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(vb, index: 2); e.setTexture(va, index: 3)
+            e.setTexture(selOut, index: 4)
+            e.setBytes(&blk, length: 8, index: 0)
+            e.setBuffer(badCount, offset: 0, index: 1)
+            var spOn = SIMD4<Float>(Self.splat ? 1 : 0, 0, Self.splat ? G : 1, Self.splatHard)
+            e.setTexture(fA, index: 5); e.setTexture(fB, index: 6)
+            e.setBuffer(tp.spA, offset: 0, index: 5); e.setBuffer(tp.spB, offset: 0, index: 6); e.setBytes(&spOn, length: 16, index: 7)
+            e.setBytes(&glob, length: 8, index: 2)
+            e.setBytes(&opt, length: 8, index: 3)
+            e.setBytes(&lam, length: 4, index: 4)
+            e.setBuffer(hudS[hudPar], offset: 0, index: 8); e.setBuffer(hudS[1 - hudPar], offset: 0, index: 9); e.setBytes(&hudOn, length: 4, index: 10)
+            e.setBuffer(emaBuf, offset: 0, index: 11)
+            e.setBuffer(hudAny, offset: hudPar * 4, index: 12); e.setBuffer(hudAny, offset: (1 - hudPar) * 4, index: 13)
+            e.setTexture(gridAlt, index: 7)
+            dispatch(e, tp.select, selSize)
+            if selOut === gm && ((Self.p2 & 64) != 0 || (Self.p3 & 8) != 0) {
+                cut("select")
+                after?()
+                var th = SIMD2<Float>(Self.holeCost, 0.06)
+                e.setTexture(ga, index: 0); e.setTexture(gb, index: 1); e.setTexture(gm, index: 2); e.setTexture(gx, index: 3)
+                e.setTexture(fA, index: 4); e.setTexture(fB, index: 5)
+                e.setBytes(&G, length: 4, index: 0); e.setBuffer(hudS[hudPar], offset: 0, index: 1); e.setBytes(&hudOn, length: 4, index: 2)
+                e.setBytes(&th, length: 8, index: 3); e.setBuffer(hudAny, offset: hudPar * 4, index: 4)
+                dispatch(e, tp.gridFix, gridSize)
+                selOut = gx
+            } else if let after { barrier(); after() }
+            return selOut
+        }
+        func gfinalPass() {                              // grouped, grown glyph mask (seeds written long before)
             e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(gSeed, index: 2); e.setTexture(gMask, index: 3)
             e.setBuffer(gBins, offset: 0, index: 0); e.setBytes(&bandRows, length: 8, index: 1); e.setBuffer(gAny, offset: 0, index: 2)
             dispatch(e, psoGFinal, Size(guide.width, Int(band.y - band.x)))
-            if Self.profile { cut("gfinal") }
+            if prof { cut("gfinal") }
         }
-        var fb = Self.fallback
+        // The warp's row split: rows that cannot reach the subtitle band run the plain kernel. With MFG_REACH the
+        // whole frame goes through the indirect grids (the reach is only known on the GPU).
+        let np = j.passes.count
+        let wsplit = glyph ? (Self.measReach ? 0 : max(0, min(guide.height, Int(band.x) - 48))) : guide.height
+        var argsDone = false
+        func gargsPass() {
+            let t = tg[ObjectIdentifier(j.passes[0].upwarp)] ?? MTLSize(width: 16, height: 16, depth: 1)
+            var n = SIMD4<UInt32>(UInt32((guide.width + t.width - 1) / t.width), UInt32(t.height), UInt32(wsplit), UInt32(guide.height))
+            // VideoToolbox candidates' largest |dy| (1/16 guide px) and the largest phase share (1/16).
+            var rr = SIMD2<UInt32>(UInt32((max(Self.maxAbsY(vBpb), vApb.map(Self.maxAbsY) ?? 0) * 16).rounded(.up)), np == 3 ? 12 : 8)
+            e.setComputePipelineState(psoGArgs)
+            e.setBuffer(gAny, offset: 0, index: 0); e.setBuffer(gArgs, offset: 0, index: 1); e.setBytes(&n, length: 16, index: 2)
+            e.setBytes(&rr, length: 8, index: 3)
+            e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        }
+        func emaPass() {
+            // After the selection (it read the mean of the previous pairs): fold the newer frame in, ~1 s time constant.
+            var rate: Float = hudClear ? 1 : 1.0 / 32
+            e.setTexture(gbRaw, index: 0); e.setBuffer(emaBuf, offset: 0, index: 0); e.setBytes(&rate, length: 4, index: 1)
+            dispatch(e, psoEma, guide)
+        }
+        func warpPass(_ pi: Int, _ tp: TPass, _ selOut: MTLTexture) {
+        let yO = j.yOs[pi], cO = j.cOs[pi]
         let fused = Self.fuse && selOut !== midTex && Self.refinePasses == 0 && !Self.smooth && Self.debugView == 0
         if fused {
             cut(selOut === gridFix ? "gridfix" : "select")
@@ -693,12 +957,12 @@ public final class MotionInterpolator: @unchecked Sendable {
             e.setTexture(gMask, index: 9); e.setTexture(gridAlt, index: 11)
             var bandUse = glyph ? band : SIMD2<Int32>(0, 0)
             e.setBytes(&bandUse, length: 8, index: 2)
-            var rt = Int32(ProcessInfo.processInfo.environment["MFG_RT"] ?? "0") ?? 0
+            var rt = Self.rtMode
             e.setBytes(&rt, length: 4, index: 3); e.setBuffer(gAny, offset: 0, index: 4)
             var q10: Int32 = Self.quant10 && yO.pixelFormat == .r16Unorm ? 1 : 0; e.setBytes(&q10, length: 4, index: 6)
             // Rows whose warp cannot reach the subtitle band (more than 48 guide px above it) run a copy of the
             // kernel compiled without the glyph code: its registers and lookups cost about 0.8 ms over the frame.
-            let split = glyph ? max(0, min(guide.height, Int(band.x) - 48)) : guide.height
+            let split = wsplit
             var off: Int32 = 0
             if split > 0 {
                 e.setBytes(&off, length: 4, index: 5)
@@ -710,11 +974,7 @@ public final class MotionInterpolator: @unchecked Sendable {
                     // The band rows run the glyph kernel only when this pair found a glyph (anyG); otherwise the
                     // same rows run the plain copy. gargs writes both indirect grids (one of them empty).
                     let t = tg[ObjectIdentifier(tp.upwarp)] ?? MTLSize(width: 16, height: 16, depth: 1)
-                    var n = SIMD4<UInt32>(UInt32((guide.width + t.width - 1) / t.width), UInt32(t.height), UInt32(split), UInt32(guide.height))
-                    e.setComputePipelineState(psoGArgs)
-                    e.setBuffer(gAny, offset: 0, index: 0); e.setBuffer(gArgs, offset: 0, index: 1); e.setBytes(&n, length: 16, index: 2)
-                    e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                    barrier()
+                    if !argsDone { gargsPass(); barrier() }
                     e.setBytes(&G, length: 4, index: 0); e.setBytes(&fb, length: 8, index: 1); e.setBytes(&bandUse, length: 8, index: 2)
                     e.setComputePipelineState(tp.upwarp)
                     e.setBuffer(gArgs, offset: 36, index: 5)
@@ -759,17 +1019,92 @@ public final class MotionInterpolator: @unchecked Sendable {
         e.setTexture(cA, index: 0); e.setTexture(cB, index: 1); e.setTexture(field, index: 2); e.setTexture(cO, index: 3)
         dispatch(e, psoWarpC, guide)
         }
-        }   // passes
-        if Self.hud {
-            // After the selection (it read the mean of the previous pairs): fold the newer frame in, ~1 s time constant.
+        }   // warpPass
+
+        /// Fade guard: the whole made frame becomes the cross-fade (1 - t)·A + t·B, or the zones that changed apart
+        /// from the global brightness relation (a HUD fading in, a local exposure jump) blend toward it.
+        func fadeMixPass(_ pi: Int, _ tp: TPass) {
+            guard fadeWhole || fadeW != nil, fadePlan != nil else { return }
+            let yO = j.yOs[pi], cO = j.cOs[pi]
+            var srcY = yO, srcC = cO
+            // The cross-fade over the whole frame (also a static picture with every zone static): no copy of the warp.
+            let mixWhole = fadeWhole || (fadeW?.allSatisfy { $0 >= 1 } ?? false)
+            if mixWhole { barrier() } else {
+                if fadeScratch == nil || fadeScratch!.y.pixelFormat != yO.pixelFormat {
+                    let dy = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: yO.pixelFormat, width: yO.width, height: yO.height, mipmapped: false)
+                    let dc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: cO.pixelFormat, width: cO.width, height: cO.height, mipmapped: false)
+                    dy.usage = [.shaderRead]; dc.usage = [.shaderRead]; dy.storageMode = .private; dc.storageMode = .private
+                    if let ty = device.makeTexture(descriptor: dy), let tc = device.makeTexture(descriptor: dc) { fadeScratch = (ty, tc) }
+                }
+                guard let sc = fadeScratch else { return }
+                e.endEncoding()
+                if let bl = cmd.makeBlitCommandEncoder() { bl.copy(from: yO, to: sc.y); bl.copy(from: cO, to: sc.c); bl.endEncoding() }
+                e = cmd.makeComputeCommandEncoder(dispatchType: .concurrent)!
+                srcY = sc.y; srcC = sc.c
+            }
+            e.setTexture(yA, index: 0); e.setTexture(yB, index: 1); e.setTexture(srcY, index: 2); e.setTexture(yO, index: 3)
+            e.setTexture(cA, index: 4); e.setTexture(cB, index: 5); e.setTexture(srcC, index: 6); e.setTexture(cO, index: 7)
+            var fp = SIMD4<Float>(tp.t, Self.quant10 && yO.pixelFormat == .r16Unorm ? 1 : 0, mixWhole ? 1 : 0, 0)
+            var w = fadeW ?? [0]
+            var z = SIMD4<UInt32>(UInt32(FadePlan.zx), UInt32(FadePlan.zy), UInt32(cO.width), UInt32(cO.height))
+            e.setBytes(&fp, length: 16, index: 0); e.setBytes(&w, length: w.count * 4, index: 1); e.setBytes(&z, length: 16, index: 2)
+            dispatch(e, psoFadeMix, Size(cO.width, cO.height))
+        }
+
+        // The made frames. 60 FPS: t = 0.5 alone. 4x: 0.25, 0.5, 0.75 in that order, one command buffer for all;
+        // with MFG_PHASE one command buffer per phase, t = 0.25 first: the midpoint's selection runs first (its bad /
+        // poor counts decide a cut or a rejected pair before any phase is shown), then 0.25 is selected and warped
+        // and delivered while 0.5 and 0.75 are still on the GPU.
+        let phased = np == 3 && Self.phaseSplit && !prof && gridMid4.count == 2
+        var segs: [MTLCommandBuffer] = [], segPhases: [[Int]] = []
+        // MFG_REORDER: gfinal next to the splat, gargs and the means update next to the grid fix (no extra barriers).
+        let reo = Self.reorder && !prof && Self.splat && Self.fuse
+        var emaDone = false
+        if reo && glyph { gfinalPass() }
+        func afterSel(_ last: Bool) -> (() -> Void)? {
+            guard reo else { return nil }
+            return {
+                if glyph && !argsDone { gargsPass(); argsDone = true }
+                if last && Self.hud { emaPass(); emaDone = true }
+            }
+        }
+        if Self.splat && np == 3 && Self.splat3, let k3 = psoSplat3 { splat3Pass(j.passes, k3) }
+        let splatEach = Self.splat && !(np == 3 && Self.splat3 && psoSplat3 != nil)
+        if phased {
+            if splatEach { for tp in j.passes { splatPass(tp) } }
+            let s1 = selectPass(j.passes[1], gridMid, gridFix, after: afterSel(false))
+            dumpSel(j.passes[1], s1)
+            if glyph && !reo { gfinalPass() }
             barrier()
-            var rate: Float = hudClear ? 1 : 1.0 / 32
-            e.setTexture(gb, index: 0); e.setBuffer(emaBuf, offset: 0, index: 0); e.setBytes(&rate, length: 4, index: 1)
-            dispatch(e, psoEma, guide)
+            let s0 = selectPass(j.passes[0], gridMid4[0], gridFix4[0])
+            dumpSel(j.passes[0], s0)
+            warpPass(0, j.passes[0], s0); fadeMixPass(0, j.passes[0])
+            segs.append(cmd); segPhases.append([0])
+            guard nextBuffer() else { return j.finish(nil, Self.err("command buffer")) }
+            warpPass(1, j.passes[1], s1); fadeMixPass(1, j.passes[1])
+            segs.append(cmd); segPhases.append([1])
+            guard nextBuffer() else { return j.finish(nil, Self.err("command buffer")) }
+            let s2 = selectPass(j.passes[2], gridMid4[1], gridFix4[1], after: afterSel(true))
+            dumpSel(j.passes[2], s2)
+            warpPass(2, j.passes[2], s2); fadeMixPass(2, j.passes[2])
+        } else {
+            for (pi, tp) in j.passes.enumerated() {
+                if pi > 0 { barrier() }
+                if splatEach { splatPass(tp) }
+                let s = selectPass(tp, gridMid, gridFix, after: afterSel(pi == np - 1))
+                if glyph && pi == 0 && !reo { gfinalPass() }
+                dumpSel(tp, s)
+                warpPass(pi, tp, s); fadeMixPass(pi, tp)
+            }
+        }
+        if Self.hud && !emaDone {
+            barrier()
+            emaPass()
         }
         hudClear = false
-        if Self.profile { cut("warp") }
+        if prof { cut("warp") }
         e.endEncoding()
+        segs.append(cmd); segPhases.append(phased ? [2] : Array(0..<np))
         let total = Float(Self.splat ? gridSize.width * gridSize.height : guide.width * guide.height), counter = badCount
         let tc = CACurrentMediaTime()
         if Self.trace { Self.stageMs["cpu.post", default: []].append((tc - tm1) * 1000) }
@@ -777,31 +1112,63 @@ public final class MotionInterpolator: @unchecked Sendable {
         if Self.splat { par = 1 - par; hasPrev = true }
         hudPar = 1 - hudPar
 
-        cmd.addCompletedHandler { [self] cb in
-            _ = j.keep
-            if Self.trace {
-                Self.gpu.append((cb.gpuEndTime - cb.gpuStartTime) * 1000)
-                Self.stageMs["lat.start", default: []].append((cb.gpuStartTime - tc) * 1000)
-                Self.stageMs["lat.done", default: []].append((CACurrentMediaTime() - cb.gpuEndTime) * 1000)
+        let first = early ?? segs[0], steps = Steps(segs.count), tIn = j.tIn
+        for (k, seg) in segs.enumerated() {
+            let last = k == segs.count - 1, phases = segPhases[k]
+            seg.addCompletedHandler { [self] cb in
+                steps.wait(k)
+                defer { steps.done(k) }
+                _ = j.keep
+                if j.failed == nil, let err = cb.error ?? (k == 0 ? early?.error : nil) { j.failed = err }
+                if k == 0 && j.failed == nil {
+                    let cnt = counter.contents().assumingMemoryBound(to: UInt32.self)
+                    let bad = Float(cnt[0]) / total, poor = Float(cnt[1]) / total
+                    j.outcome = Self.classify(bad: bad, poor: poor, cut: j.cut)
+                    // A fade pair's cross-fade is clean even where nothing matched, and a fade to or from a flat
+                    // picture (black, grey) reads as a hard cut but is a fade; any other hard cut still repeats A.
+                    if fadeWhole && (j.outcome == .rejected || (j.outcome == .cut && fadePlan?.flat == true)) { j.outcome = .made }
+                    if Self.cutLog { print(String(format: "pair %d bad %.4f poor %.4f struct %.3f hist %.3f -> %@", pairs, bad, poor, j.cut.x, j.cut.y, "\(j.outcome)")) }
+                }
+                let outcome = j.outcome
+                if j.failed == nil && !(Self.rejectSkips && outcome == .rejected) {
+                    for p in phases {
+                        let o = j.outs[p]
+                        // A hard cut (or nothing reliable to interpolate): every made frame of the pair is a clean copy of A.
+                        if outcome != .made && !Self.copyPlanes(from: prev, to: o) { j.failed = Self.err("copy"); break }
+                        CVBufferPropagateAttachments(cur, o)
+                        if Self.trace && p == 0 { Self.stageMs["phase0", default: []].append((CACurrentMediaTime() - tIn) * 1000) }
+                        j.phase(p, o)
+                    }
+                }
+                guard last else { return }
+                if let dir = dumpDir {
+                    for d in dumpBufs { try? Data(bytes: d.buf.contents(), count: d.buf.length).write(to: URL(fileURLWithPath: d.path)) }
+                    Self.dumpIndex(dir, String(format: "%d,%@,%.4f,%.4f,%d,%d,%d,%d,%d,%d\n", j.index, j.failed == nil ? "\(outcome)" : "failed",
+                                               glob.x, glob.y, size.width, size.height, guide.width, guide.height, gridSize.width, gridSize.height))
+                }
+                if Self.trace {
+                    Self.gpu.append((cb.gpuEndTime - first.gpuStartTime) * 1000)
+                    Self.stageMs["lat.start", default: []].append((first.gpuStartTime - tc) * 1000)
+                    Self.stageMs["lat.done", default: []].append((CACurrentMediaTime() - cb.gpuEndTime) * 1000)
+                }
+                if let err = j.failed {
+                    owner.async { [self] in hasPrev = false }
+                    lastOutcome = outcome
+                    return j.finish(nil, err)
+                }
+                if outcome != .made {
+                    // The next pair starts without the temporal seeds of this one.
+                    owner.async { [self] in hasPrev = false }
+                    if Self.rejectSkips && outcome == .rejected { lastOutcome = outcome; return j.finish(nil, nil) }
+                }
+                lastOutcome = outcome
+                lastPairWasCut = outcome == .cut
+                lastPairFaded = fadeWhole && outcome == .made
+                if lastPairFaded { owner.async { [self] in hasPrev = false } }   // the fields of a fade seed nothing
+                j.finish(j.outs, nil)
             }
-            if let err = cb.error { owner.async { [self] in hasPrev = false }; return j.finish(nil, err) }
-            let cnt = counter.contents().assumingMemoryBound(to: UInt32.self)
-            let bad = Float(cnt[0]) / total, poor = Float(cnt[1]) / total
-            let outcome = Self.classify(bad: bad, poor: poor, cut: j.cut)
-            if Self.cutLog { print(String(format: "pair %d bad %.4f poor %.4f struct %.3f hist %.3f -> %@", pairs, bad, poor, j.cut.x, j.cut.y, "\(outcome)")) }
-            if outcome != .made {
-                // A hard cut (or nothing reliable to interpolate): every made frame of the pair is a clean copy of A.
-                // The next pair starts without the temporal seeds of this one.
-                owner.async { [self] in hasPrev = false }
-                if Self.rejectSkips && outcome == .rejected { lastOutcome = outcome; return j.finish(nil, nil) }
-                for o in j.outs where !Self.copyPlanes(from: prev, to: o) { lastOutcome = outcome; return j.finish(nil, Self.err("copy")) }
-            }
-            for o in j.outs { CVBufferPropagateAttachments(cur, o) }
-            lastOutcome = outcome
-            lastPairWasCut = outcome == .cut
-            j.finish(j.outs, nil)
         }
-        cmd.commit()
+        for s in segs { s.commit() }
     }
 
     // MARK: helpers
@@ -836,6 +1203,27 @@ public final class MotionInterpolator: @unchecked Sendable {
         return p
     }
 
+    /// MFG_FIELDDUMP: one plane of a CPU-readable pixel buffer to a file, rows packed (no row padding).
+    static func dumpPlane(_ pb: CVPixelBuffer, bytesPerPx: Int, to path: String) {
+        CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rb = CVPixelBufferGetBytesPerRow(pb)
+        var d = Data(capacity: w * h * bytesPerPx)
+        for y in 0..<h { d.append(Data(bytes: base.advanced(by: y * rb), count: w * bytesPerPx)) }
+        try? d.write(to: URL(fileURLWithPath: path))
+    }
+    /// MFG_FIELDDUMP: one line of DIR/pairs.csv (header written with the first line).
+    private static let dumpLock = NSLock()
+    static func dumpIndex(_ dir: String, _ line: String) {
+        dumpLock.lock(); defer { dumpLock.unlock() }
+        let path = dir + "/pairs.csv"
+        if !FileManager.default.fileExists(atPath: path) {
+            try? "pair,outcome,glob_x,glob_y,frame_w,frame_h,guide_w,guide_h,grid_w,grid_h\n".write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        guard let h = FileHandle(forWritingAtPath: path) else { return }
+        h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close()
+    }
+
     /// Median vector of a motion field (rg16Float, guide px): the camera motion. Occluded pixels take the candidate
     /// nearest to it as background. And the mean vector length (guide px), on the same sampled grid: forward driving
     /// has a near-zero median but a large mean. One locked pass; xs / ys are reusable scratch.
@@ -862,7 +1250,266 @@ public final class MotionInterpolator: @unchecked Sendable {
     }
     private var medX: [Float] = [], medY: [Float] = []
 
+    /// Largest |vertical component| of a VideoToolbox field (guide px), every cell (MFG_REACH).
+    static func maxAbsY(_ pb: CVPixelBuffer) -> Float {
+        CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return 0 }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rb = CVPixelBufferGetBytesPerRow(pb)
+        var m: Float = 0
+        for y in 0..<h {
+            let row = base.advanced(by: y * rb).assumingMemoryBound(to: Float16.self)
+            for x in 0..<w { m = max(m, abs(Float(row[2 * x + 1]))) }
+        }
+        return m
+    }
+
     private static func err(_ m: String) -> NSError { NSError(domain: "Motion", code: 2, userInfo: [NSLocalizedDescriptionKey: m]) }
+
+    // MARK: fades and exposure changes (motion-fade)
+
+    /// Fade guard (MFG_FADE=0 off). The block matching assumes constant brightness: on a fade (map or menu fading
+    /// out, a scene fading in) or an exposure change (tunnel exit) it picks wrong vectors and the made frame shows
+    /// dark blotches and shredded HUD. Before the motion search the A/B luma relation is measured per zone on the
+    /// guides (CPU, sparse); a pair whose global brightness or contrast changed past the trigger is a fade pair:
+    /// - MFG_FNORM: B's guide is normalized to A (gain / offset per zone, bilinear) for the motion search and every
+    ///   guide cost after it;
+    /// - MFG_FXF: an endpoint is flat (fade from / to black or grey) or the content did not move (zero-motion
+    ///   correlation high): the made frame is the clean cross-fade (1 - t)·A + t·B;
+    /// - MFG_FBLEND: zones whose change departs from the global relation (HUD fading in) blend toward the cross-fade.
+    /// Pairs under the trigger are untouched (bit-identical made frames).
+    nonisolated(unsafe) static var fade = ProcessInfo.processInfo.environment["MFG_FADE"] != "0"
+    nonisolated(unsafe) static var fadeNorm = ProcessInfo.processInfo.environment["MFG_FNORM"] != "0"
+    nonisolated(unsafe) static var fadeXF = ProcessInfo.processInfo.environment["MFG_FXF"] != "0"
+    nonisolated(unsafe) static var fadeBlend = ProcessInfo.processInfo.environment["MFG_FBLEND"] != "0"
+    /// Bench: one line per fade pair (MFG_FADELOG=1; =2 every pair).
+    nonisolated(unsafe) static var fadeLog = ProcessInfo.processInfo.environment["MFG_FADELOG"] != nil
+    nonisolated(unsafe) static var fadeLogAll = ProcessInfo.processInfo.environment["MFG_FADELOG"] == "2"
+    /// Trigger (guide units 0...1): global mean change, |log| of the contrast (std) ratio. Flat endpoint std,
+    /// zero-motion correlation for the cross-fade.
+    nonisolated(unsafe) static var fadeT: SIMD4<Float> = {
+        let e = ProcessInfo.processInfo.environment
+        func f(_ k: String, _ d: Float) -> Float { Float(e[k] ?? "") ?? d }
+        return SIMD4(f("MFG_FADEM", 0.03), f("MFG_FADER", 0.15), f("MFG_FADEFLAT", 0.02), f("MFG_FADEC", 0.90))
+    }()
+    /// Still-picture fade trigger: mean change, |log| contrast ratio, and the zero-motion correlation it needs.
+    nonisolated(unsafe) static var fadeT2: SIMD3<Float> = {
+        let e = ProcessInfo.processInfo.environment
+        func f(_ k: String, _ d: Float) -> Float { Float(e[k] ?? "") ?? d }
+        return SIMD3(f("MFG_FADEM2", 0.01), f("MFG_FADER2", 0.04), f("MFG_FADEC2", 0.97))
+    }()
+    /// Static-picture rule (MFG_FSTATIC): share of static zones that turns it on, RMS difference of a static zone.
+    nonisolated(unsafe) static var fadeStatic = ProcessInfo.processInfo.environment["MFG_FSTATIC"] != "0"
+    nonisolated(unsafe) static var fadeS: SIMD2<Float> = {
+        let e = ProcessInfo.processInfo.environment
+        func f(_ k: String, _ d: Float) -> Float { Float(e[k] ?? "") ?? d }
+        return SIMD2(f("MFG_STATN", 0.5), f("MFG_STATD", 0.006))
+    }()
+    /// Mean-change trigger: the median zone change must also exceed this share of the global std (MFG_FADEMS).
+    nonisolated(unsafe) static var fadeMS = Float(ProcessInfo.processInfo.environment["MFG_FADEMS"] ?? "") ?? 0.3
+    /// Share of zones that must move with the median change for the trigger (MFG_FADEA).
+    nonisolated(unsafe) static var fadeAgree = Float(ProcessInfo.processInfo.environment["MFG_FADEA"] ?? "") ?? 0.6
+    /// Zone blend ramp on the departure from the global relation (MFG_FADEB0 -> MFG_FADEB1).
+    nonisolated(unsafe) static var fadeB: SIMD2<Float> = {
+        let e = ProcessInfo.processInfo.environment
+        func f(_ k: String, _ d: Float) -> Float { Float(e[k] ?? "") ?? d }
+        return SIMD2(f("MFG_FADEB0", 0.25), f("MFG_FADEB1", 0.60))
+    }()
+
+    /// Per zone (FadePlan.zx × zy over the guide) sums of A, B, A², B², A·B on a sparse grid (every 4th guide px).
+    struct LumaRelation {
+        static let zones = FadePlan.zx * FadePlan.zy
+        var n = [Float](repeating: 0, count: zones), sa = [Float](repeating: 0, count: zones), sb = [Float](repeating: 0, count: zones)
+        var saa = [Float](repeating: 0, count: zones), sbb = [Float](repeating: 0, count: zones), sab = [Float](repeating: 0, count: zones)
+    }
+
+    /// What the fade guard does with a pair.
+    struct FadePlan: Sendable {
+        static let zx = 16, zy = 9
+        /// A fade / exposure pair (over the trigger); the whole made frame is the cross-fade.
+        var trigger = false, whole = false
+        /// No fade, but a static picture: `w` marks the static interior zones (MFG_FSTATIC).
+        var staticOnly = false
+        /// An endpoint is flat (std under MFG_FADEFLAT): a fade to or from black / grey.
+        var flat = false
+        /// Per zone: normalization of B to A (gain, offset) and the blend weight toward the cross-fade.
+        var norm: [SIMD2<Float>] = [], w: [Float] = []
+        var anyBlend: Bool { w.contains { $0 > 0 } }
+        var log = ""
+    }
+
+    static func lumaRelation(_ a: CVPixelBuffer, _ b: CVPixelBuffer) -> LumaRelation {
+        var r = LumaRelation()
+        CVPixelBufferLockBaseAddress(a, .readOnly); CVPixelBufferLockBaseAddress(b, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(b, .readOnly); CVPixelBufferUnlockBaseAddress(a, .readOnly) }
+        guard let pa = CVPixelBufferGetBaseAddress(a), let pb = CVPixelBufferGetBaseAddress(b) else { return r }
+        let w = min(CVPixelBufferGetWidth(a), CVPixelBufferGetWidth(b)), h = min(CVPixelBufferGetHeight(a), CVPixelBufferGetHeight(b))
+        let ra = CVPixelBufferGetBytesPerRow(a), rb = CVPixelBufferGetBytesPerRow(b)
+        let zx = FadePlan.zx, zy = FadePlan.zy
+        guard w > 4, h > 4 else { return r }
+        let xz = (0..<w).map { min($0 * zx / w, zx - 1) }
+        for y in stride(from: 2, to: h, by: 4) {
+            let la = pa.advanced(by: y * ra).assumingMemoryBound(to: UInt8.self), lb = pb.advanced(by: y * rb).assumingMemoryBound(to: UInt8.self)
+            let zr = min(y * zy / h, zy - 1) * zx
+            var x = 2
+            while x < w {
+                // One zone run at a time: integer sums, then one store.
+                let z = xz[x]
+                var n = 0, s1 = 0, s2 = 0, s11 = 0, s22 = 0, s12 = 0
+                while x < w && xz[x] == z {
+                    let u = Int(la[x]), v = Int(lb[x])
+                    n += 1; s1 += u; s2 += v; s11 += u * u; s22 += v * v; s12 += u * v
+                    x += 4
+                }
+                let k = zr + z
+                r.n[k] += Float(n); r.sa[k] += Float(s1) / 255; r.sb[k] += Float(s2) / 255
+                r.saa[k] += Float(s11) / 65025; r.sbb[k] += Float(s22) / 65025; r.sab[k] += Float(s12) / 65025
+            }
+        }
+        return r
+    }
+
+    static func fadePlan(_ r: LumaRelation) -> FadePlan {
+        var p = FadePlan()
+        let N = r.n.reduce(0, +)
+        guard N > 0 else { return p }
+        let mA = r.sa.reduce(0, +) / N, mB = r.sb.reduce(0, +) / N
+        let sdA = max(0, r.saa.reduce(0, +) / N - mA * mA).squareRoot(), sdB = max(0, r.sbb.reduce(0, +) / N - mB * mB).squareRoot()
+        let eps: Float = 0.01
+        let nz = r.n.count
+        // Per zone: mean change, log contrast ratio, zero-motion correlation, normalization of B to A.
+        var dmz = [Float](repeating: 0, count: nz), lrz = dmz, corr = dmz
+        var norm = [SIMD2<Float>](repeating: SIMD2(1, 0), count: nz)
+        var live: [Int] = []
+        for k in 0..<nz where r.n[k] > 0 {
+            live.append(k)
+            let n = r.n[k], a = r.sa[k] / n, b = r.sb[k] / n
+            let va = max(0, r.saa[k] / n - a * a), vb = max(0, r.sbb[k] / n - b * b), cv = r.sab[k] / n - a * b
+            let flatA = va < 1e-4, flatB = vb < 1e-4
+            corr[k] = flatA && flatB ? 1 : (flatA || flatB ? 0 : cv / (va * vb).squareRoot())
+            let g = min(4, max(0.25, (va.squareRoot() + eps) / (vb.squareRoot() + eps)))
+            norm[k] = SIMD2(g, a - g * b)
+            dmz[k] = b - a; lrz[k] = log((vb.squareRoot() + eps) / (va.squareRoot() + eps))
+        }
+        guard !live.isEmpty else { return p }
+        defer { if !p.trigger && fadeStatic { staticZones(r, &p) } }
+        // A fade or an exposure change moves most zones the same way; content (a white sign sweeping in, a flash
+        // in one corner) moves a few zones a lot. Trigger on the median zone change, with most zones agreeing.
+        func median(_ v: [Float]) -> Float { let s = live.map { v[$0] }.sorted(); return s[s.count / 2] }
+        let mdm = median(dmz), mlr = median(lrz)
+        let T = fadeT, A = fadeAgree
+        let agreeM = Float(live.filter { dmz[$0] * mdm > 0 && abs(dmz[$0]) >= 0.5 * T.x }.count) / Float(live.count)
+        let agreeR = Float(live.filter { lrz[$0] * mlr > 0 && abs(lrz[$0]) >= 0.5 * T.y }.count) / Float(live.count)
+        // A mean change also has to be large against the picture's contrast: a high-contrast pattern panning moves
+        // zone means by chance (the synthetic checker pan: 0.06 against a std of 0.27), a fade moves them all.
+        let mOK = abs(mdm) > Self.fadeMS * max(sdA, sdB)
+        p.trigger = (abs(mdm) > T.x && agreeM >= A && mOK) || (abs(mlr) > T.y && agreeR >= A)
+        // A still picture with a slow fade (map or menu closing, 33 ms pairs): a smaller change, but the content
+        // matches at zero motion almost everywhere.
+        let T2 = fadeT2
+        // Only zones with texture count here (flat water or sky neither fades in contrast nor proves a match), and
+        // the correlation is pooled (cov / sd·sd summed over them).
+        var still = false
+        // All zones (a picture fading to flat grey or black: most zones lose their texture together)...
+        if !p.trigger {
+            let agM = Float(live.filter { dmz[$0] * mdm > 0 && abs(dmz[$0]) >= 0.5 * T2.x }.count) / Float(live.count)
+            let agR = Float(live.filter { lrz[$0] * mlr > 0 && abs(lrz[$0]) >= 0.5 * T2.y }.count) / Float(live.count)
+            if (abs(mdm) > T2.x && agM >= A) || (abs(mlr) > T2.y && agR >= A) {
+                var cs: Float = 0
+                for k in live { cs += r.n[k] * corr[k] }
+                still = cs / N >= T2.z
+                p.trigger = still
+            }
+        }
+        // ...or the textured zones only (a map over flat water fading as a whole).
+        if !p.trigger {
+            var tex: [Int] = [], cs: Float = 0, ss: Float = 0
+            for k in live {
+                let n = r.n[k], a = r.sa[k] / n, b = r.sb[k] / n
+                let va = max(0, r.saa[k] / n - a * a), vb = max(0, r.sbb[k] / n - b * b)
+                guard max(va, vb) > 1e-4 else { continue }
+                tex.append(k); cs += n * (r.sab[k] / n - a * b); ss += n * (va * vb).squareRoot()
+            }
+            if !tex.isEmpty {
+                let tdm = tex.map { dmz[$0] }.sorted()[tex.count / 2], tlr = tex.map { lrz[$0] }.sorted()[tex.count / 2]
+                let agM = Float(tex.filter { dmz[$0] * tdm > 0 && abs(dmz[$0]) >= 0.5 * T2.x }.count) / Float(tex.count)
+                let agR = Float(tex.filter { lrz[$0] * tlr > 0 && abs(lrz[$0]) >= 0.5 * T2.y }.count) / Float(tex.count)
+                if (abs(tdm) > T2.x && agM >= A) || (abs(tlr) > T2.y && agR >= A) {
+                    still = ss > 0 && cs / ss >= T2.z
+                    p.trigger = still
+                }
+            }
+        }
+        guard p.trigger || fadeLog else { return p }
+        var corrSum: Float = 0
+        p.w = [Float](repeating: 0, count: nz)
+        for k in live {
+            corrSum += r.n[k] * corr[k]
+            // Departure from the common relation: a zone that changed its own way (HUD fading in).
+            let d = abs(lrz[k] - mlr) + 2 * abs(dmz[k] - mdm)
+            p.w[k] = p.trigger ? min(1, max(0, (d - fadeB.x) / (fadeB.y - fadeB.x))) : 0
+        }
+        p.norm = norm
+        let corrAvg = corrSum / N
+        let flat = min(sdA, sdB) < T.z
+        p.whole = p.trigger && (flat || corrAvg >= T.w || still)
+        p.flat = flat
+        p.log = String(format: "fade %@ mA %.3f mB %.3f sdA %.3f sdB %.3f mdm %+.3f/%.2f mlr %+.3f/%.2f corr %.3f flat %d whole %d blend %d/%d maxw %.2f",
+                       p.trigger ? "ON " : "off", mA, mB, sdA, sdB, mdm, agreeM, mlr, agreeR, corrAvg, flat ? 1 : 0, p.whole ? 1 : 0,
+                       p.w.filter { $0 > 0 }.count, nz, p.w.max() ?? 0)
+        if fadeLogAll && !p.trigger { print(p.log) }
+        return p
+    }
+
+    /// Static picture (MFG_FSTATIC): a map or menu left open. When at least `MFG_STATN` of the zones did not change
+    /// (RMS A/B difference on the guide under `MFG_STATD`), the zones that are static with their four neighbours
+    /// take the plain A/B blend instead of the warp: a wrong nonzero vector there copies dark specks.
+    static func staticZones(_ r: LumaRelation, _ p: inout FadePlan) {
+        let zx = FadePlan.zx, zy = FadePlan.zy, nz = zx * zy, S = fadeS
+        var st = [Bool](repeating: false, count: nz)
+        for k in 0..<nz where r.n[k] > 0 {
+            let n = r.n[k]
+            st[k] = max(0, (r.saa[k] - 2 * r.sab[k] + r.sbb[k]) / n) < S.y * S.y
+        }
+        let share = Float(st.filter { $0 }.count) / Float(nz)
+        guard share >= S.x else { return }
+        var w = [Float](repeating: 0, count: nz), any = false
+        for y in 0..<zy { for x in 0..<zx where st[y * zx + x] {
+            // Interior only: the bilinear weight then never reaches a zone that moved.
+            let nb = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].allSatisfy { $0.0 < 0 || $0.0 >= zx || $0.1 < 0 || $0.1 >= zy || st[$0.1 * zx + $0.0] }
+            if nb { w[y * zx + x] = 1; any = true }
+        } }
+        guard any else { return }
+        p.w = w; p.staticOnly = true
+        if fadeLog { p.log = String(format: "static %.2f of zones, %d interior", share, w.filter { $0 > 0 }.count); print(p.log) }
+    }
+
+    /// B's guide normalized to A (per zone gain / offset, bilinear between zone centres) into a new guide buffer.
+    private final class TexKeep: @unchecked Sendable { var t: [CVMetalTexture] = [] }
+    private func normalizeGuide(_ g: CVPixelBuffer, _ plan: FadePlan) async -> CVPixelBuffer? {
+        guard let guidePool, let cache, plan.norm.count == FadePlan.zx * FadePlan.zy else { return nil }
+        var o: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, guidePool, &o)
+        let keep = TexKeep()
+        func t(_ pb: CVPixelBuffer) -> MTLTexture? {
+            var ct: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .r8Unorm, guide.width, guide.height, 0, &ct)
+            guard let ct else { return nil }
+            keep.t.append(ct)
+            return CVMetalTextureGetTexture(ct)
+        }
+        guard let o, let ti = t(g), let to = t(o), let cmd = queue.makeCommandBuffer(), let e = cmd.makeComputeCommandEncoder() else { return nil }
+        var nt = plan.norm
+        var z = SIMD4<UInt32>(UInt32(FadePlan.zx), UInt32(FadePlan.zy), UInt32(guide.width), UInt32(guide.height))
+        e.setTexture(ti, index: 0); e.setTexture(to, index: 1)
+        e.setBytes(&nt, length: nt.count * 8, index: 0); e.setBytes(&z, length: 16, index: 1)
+        dispatch(e, psoLNorm, guide)
+        e.endEncoding()
+        let ok: Bool = await withCheckedContinuation { c in
+            cmd.addCompletedHandler { cb in _ = keep.t; c.resume(returning: cb.error == nil) }
+            cmd.commit()
+        }
+        return ok ? o : nil
+    }
 
     // MARK: hard scene cuts
 
@@ -1012,6 +1659,18 @@ public final class MotionInterpolator: @unchecked Sendable {
     constant bool kGFoot [[function_constant(47)]];
     // v0.7: exact early exit of the selection's 5×5 window (MFG_SELX=1; off: bit-identical but 0.1 ms slower on an M2).
     constant bool kSelExit [[function_constant(48)]];
+    // v0.8: the anchored search / subtitle seeds split around the motion search (0 whole, 1 before, 2 after; MFG_PRE),
+    // exact early exit of the anchored match (MFG_AEXIT), static-HUD reads skipped while no cell is masked (MFG_HUDSKIP).
+    constant int kAPhase [[function_constant(49)]];
+    constant int kGPhase [[function_constant(50)]];
+    constant bool kAExit [[function_constant(51)]];
+    constant bool kHudSkip [[function_constant(52)]];
+    constant bool kX53 [[function_constant(53)]];           // spare bench switches (MFG_X53 ... MFG_X56, MFG_XF57)
+    constant bool kX54 [[function_constant(54)]];
+    constant bool kX55 [[function_constant(55)]];
+    constant bool kX56 [[function_constant(56)]];
+    constant float kXF57 [[function_constant(57)]];
+    constant bool kReach [[function_constant(58)]];         // v0.8: measured subtitle-guard reach (MFG_REACH)
     #define TA (kT)
     #define TB (1.0 - kT)
     #define BLT(a, b) (kT == 0.5 ? 0.5 * ((a) + (b)) : mix((a), (b), kT))
@@ -1029,6 +1688,46 @@ public final class MotionInterpolator: @unchecked Sendable {
                         uint2 id [[thread_position_in_grid]]) {
         if (id.x >= o.get_width() || id.y >= o.get_height()) return;
         o.write(-v.read(id), id);
+    }
+
+    // Fade guard: B's guide normalized to A, per zone (gain, offset) interpolated between zone centres.
+    inline float2 zoneUV(uint2 id, uint4 z) {
+        return clamp((float2(id) + 0.5) * float2(z.xy) / float2(z.zw) - 0.5, float2(0), float2(z.xy) - 1.0);
+    }
+    kernel void mfg_lnorm(texture2d<float, access::read> g [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],
+                          constant float2 *go [[buffer(0)]], constant uint4 &z [[buffer(1)]], uint2 id [[thread_position_in_grid]]) {
+        if (id.x >= z.z || id.y >= z.w) return;
+        float2 f = zoneUV(id, z); uint2 i0 = uint2(f), i1 = min(i0 + 1, z.xy - 1); f -= float2(i0);
+        float2 v = mix(mix(go[i0.y * z.x + i0.x], go[i0.y * z.x + i1.x], f.x), mix(go[i1.y * z.x + i0.x], go[i1.y * z.x + i1.x], f.x), f.y);
+        o.write(float4(clamp(g.read(id).r * v.x + v.y, 0.0, 1.0)), id);
+    }
+    // Fade guard: the made frame (or the zones weighted by wz) becomes the cross-fade (1 - t)·A + t·B. One thread per
+    // chroma sample and its 2×2 luma px; p = (t, q10, whole, -), z = (zones x, y, chroma w, h).
+    kernel void mfg_fademix(texture2d<float, access::read> ya [[texture(0)]], texture2d<float, access::read> yb [[texture(1)]],
+                            texture2d<float, access::read> yw [[texture(2)]], texture2d<float, access::write> yo [[texture(3)]],
+                            texture2d<float, access::read> ca [[texture(4)]], texture2d<float, access::read> cb [[texture(5)]],
+                            texture2d<float, access::read> cw [[texture(6)]], texture2d<float, access::write> co [[texture(7)]],
+                            constant float4 &p [[buffer(0)]], constant float *wz [[buffer(1)]], constant uint4 &z [[buffer(2)]],
+                            uint2 id [[thread_position_in_grid]]) {
+        if (id.x >= z.z || id.y >= z.w) return;
+        float w = 1.0;
+        if (p.z == 0) {
+            float2 f = zoneUV(id, z); uint2 i0 = uint2(f), i1 = min(i0 + 1, z.xy - 1); f -= float2(i0);
+            w = mix(mix(wz[i0.y * z.x + i0.x], wz[i0.y * z.x + i1.x], f.x), mix(wz[i1.y * z.x + i0.x], wz[i1.y * z.x + i1.x], f.x), f.y);
+            if (w <= 0.002) return;                          // the warp stays
+        }
+        #define FQ10(v) (p.y != 0 ? clamp(rint((v) * (65535.0 / 64.0)), 0.0, 1023.0) * (64.0 / 65535.0) : (v))
+        float t = p.x;
+        for (uint qi = 0; qi < 4; qi++) {
+            uint2 q = id * 2 + uint2(qi & 1, qi >> 1);
+            float x = mix(ya.read(q).r, yb.read(q).r, t);
+            if (w < 1.0) x = mix(yw.read(q).r, x, w);
+            yo.write(float4(FQ10(x)), q);
+        }
+        float2 c = mix(ca.read(id).rg, cb.read(id).rg, t);
+        if (w < 1.0) c = mix(cw.read(id).rg, c, w);
+        co.write(float4(FQ10(c), 0, 1), id);
+        #undef FQ10
     }
 
     kernel void mfg_guide(texture2d<float, access::sample> y [[texture(0)]], texture2d<float, access::write> g [[texture(1)]],
@@ -1152,8 +1851,11 @@ public final class MotionInterpolator: @unchecked Sendable {
                            device const uint *spA [[buffer(5)]], device const uint *spB [[buffer(6)]], constant float4 &sp [[buffer(7)]],
                            device const float2 *hudP [[buffer(8)]], device float2 *hudN [[buffer(9)]], constant int &hudOn [[buffer(10)]],
                            device const float2 *ema [[buffer(11)]], texture2d<half, access::write> alt [[texture(7)]],
+                           device const uint *hudAnyP [[buffer(12)]], device atomic_uint *hudAnyN [[buffer(13)]],
                            uint2 id [[thread_position_in_grid]]) {
-        #define CROSS(d) (hudOn != 0 ? crossPen(hudP, int2(gs), sp.z, m, d) : 0.0)
+        // kHudSkip: no cell of the previous mask is on, so no crossing can be penalised (crossPen would return 0).
+        const bool hudX = hudOn != 0 && (!kHudSkip || hudAnyP[0] != 0);
+        #define CROSS(d) (hudX ? crossPen(hudP, int2(gs), sp.z, m, d) : 0.0)
         #define SAD(pa, pb) (kSad == 2 ? sad25(ga, gb, pa, pb) : kSad != 0 ? sad9(ga, gb, pa, pb) : sad5(ga, gb, pa, pb))
         float2 gs = float2(mid.get_width(), mid.get_height());
         if (id.x >= uint(gs.x) || id.y >= uint(gs.y)) return;
@@ -1290,6 +1992,7 @@ public final class MotionInterpolator: @unchecked Sendable {
                 hn.y = hn.x >= 0.75 ? 1.0 : (hn.x < 0.35 ? 0.0 : h.y);
             }
             if (kPairWork) hudN[hi] = hn;
+            if (kPairWork && kHudSkip && hn.y > 0.5) atomic_store_explicit(hudAnyN, 1u, memory_order_relaxed);
             if (h.y > 0.5 && !(preBest < 0.03 && zc > preBest + 0.03)) {
                 masked = true; best = float2(0); bestCost = zc;
             }
@@ -1357,13 +2060,14 @@ public final class MotionInterpolator: @unchecked Sendable {
                             texture2d<half, access::read> gi [[texture(2)]], texture2d<half, access::write> go [[texture(3)]],
                             texture2d<half, access::read> fa [[texture(4)]], texture2d<half, access::read> fbf [[texture(5)]],
                             constant float &G [[buffer(0)]], device const float2 *hudP [[buffer(1)]], constant int &hudOn [[buffer(2)]],
-                            constant float2 &thr [[buffer(3)]], uint2 id [[thread_position_in_grid]]) {
+                            constant float2 &thr [[buffer(3)]], device const uint *hudAnyP [[buffer(4)]], uint2 id [[thread_position_in_grid]]) {
         int2 hi = int2(gi.get_width() - 1, gi.get_height() - 1);
         if (int(id.x) > hi.x || int(id.y) > hi.y) return;
         half4 c = gi.read(id);
         float c0 = float(c.z);
         int2 gs = hi + 1;
-        bool masked = hudOn != 0 && hudP[id.y * uint(gs.x) + id.x].y > 0.5;
+        const bool hudX = hudOn != 0 && (!kHudSkip || hudAnyP[0] != 0);
+        bool masked = hudX && hudP[id.y * uint(gs.x) + id.x].y > 0.5;
         float2 m = (float2(id) + 0.5) * G, own = float2(c.xy);
         if ((kP3 & P3_SHADOW) && !masked && c.w == 0 && c0 >= kShE) {
             // The locally supported road vector: the neighbours' vector that most of the 8 share (within 1 px), at
@@ -1414,7 +2118,7 @@ public final class MotionInterpolator: @unchecked Sendable {
             for (int q = 0; q < nt; q++) if (all(fabs(tried[q] - d) < 0.25)) { dup = true; break; }
             if (dup) continue;
             tried[nt++] = d;
-            float cost = candCost(ga, gb, m, d, kSad, d) + (hudOn != 0 ? crossPen(hudP, gs, G, m, d) : 0.0);
+            float cost = candCost(ga, gb, m, d, kSad, d) + (hudX ? crossPen(hudP, gs, G, m, d) : 0.0);
             if (cost < bt && cost < bc) { bc = cost; best = d; hit = true; }
         }
         if (!hit) { go.write(c, id); return; }
@@ -1429,23 +2133,52 @@ public final class MotionInterpolator: @unchecked Sendable {
     // Anchored match cost: 3×3 taps `tap` guide px apart around S's position (cached in sv[0..8]), centre-weighted,
     // plus (tap2 > 0) a context ring of 8 taps tap2 px out (sv[9..16]), weighted like the whole inner window.
     // Returns early (≥ bound) once the inner part alone cannot beat `bound`.
+    // kAExit (v0.8): also stops after each row of the inner window and after each half of the ring once the partial
+    // cost is surely over the bound (by 1e-6, far more than a rounding step at these costs): such a candidate loses
+    // in every caller (all of them only test cost + pen < bc with bound = bc - pen), so 1e9 stands in for its cost.
     inline float sadS(thread const float *sv, texture2d<float, access::sample> D, float2 pd, float tp, float tp2, float bound, float2 ps) {
         if (kBorder && !inF(pd, float2(D.get_width(), D.get_height()))) return 1.0;   // a match may not leave the frame
         float r = 0; int t = 0;
-        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
-            float w = 1.0 / (1.0 + float(i * i + j * j));
-            r += w * fabs(sv[t] - D.sample(lc, pd + float2(i, j) * tp).r); t++;
+        const float bx = bound + 1e-6;
+        for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+                float w = 1.0 / (1.0 + float(i * i + j * j));
+                r += w * fabs(sv[t] - D.sample(lc, pd + float2(i, j) * tp).r); t++;
+            }
+            if (kAExit && tp2 > 0 && j < 1 && r * (1.0 / (1.0 + 2.0 + 4.0 / 3.0)) * 0.5 >= bx) return 1e9;
         }
         r *= 1.0 / (1.0 + 2.0 + 4.0 / 3.0);                             // Σw
         if (tp2 <= 0) return r;
         r *= 0.5;
         if (r >= bound) return r;
         float c = 0;
+        for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+                if (i == 0 && j == 0) continue;
+                c += fabs(sv[t] - D.sample(lc, pd + float2(i, j) * tp2).r); t++;
+            }
+            if (kAExit && j == -1 && r + c * (0.5 / 8.0) >= bx) return 1e9;
+        }
+        return r + c * (0.5 / 8.0);
+    }
+    // MFG_PRE: both values sadS can return for a candidate, x = the inner part alone (returned when it reaches the
+    // bound), y = the whole cost (the same arithmetic as sadS).
+    inline float2 sadParts(thread const float *sv, texture2d<float, access::sample> D, float2 pd, float tp, float tp2) {
+        if (kBorder && !inF(pd, float2(D.get_width(), D.get_height()))) return float2(1.0);
+        float r = 0; int t = 0;
+        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+            float w = 1.0 / (1.0 + float(i * i + j * j));
+            r += w * fabs(sv[t] - D.sample(lc, pd + float2(i, j) * tp).r); t++;
+        }
+        r *= 1.0 / (1.0 + 2.0 + 4.0 / 3.0);
+        if (tp2 <= 0) return float2(r);
+        r *= 0.5;
+        float c = 0;
         for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
             if (i == 0 && j == 0) continue;
             c += fabs(sv[t] - D.sample(lc, pd + float2(i, j) * tp2).r); t++;
         }
-        return r + c * (0.5 / 8.0);
+        return float2(r, r + c * (0.5 / 8.0));
     }
     inline void loadS(thread float *sv, texture2d<float, access::sample> S, float2 m, float tp, float tp2) {
         int t = 0;
@@ -1458,11 +2191,23 @@ public final class MotionInterpolator: @unchecked Sendable {
                            texture2d<float, access::read> vs [[texture(2)]], texture2d<float, access::read> vd [[texture(3)]],
                            texture2d<half, access::write> F [[texture(4)]], constant AnchorParams &P [[buffer(0)]],
                            texture2d<half, access::read> ps [[texture(5)]], texture2d<half, access::read> po [[texture(6)]],
-                           threadgroup half2 *triedTG [[threadgroup(0)]],
+                           device float4 *pre [[buffer(1)]], threadgroup half2 *triedTG [[threadgroup(0)]],
                            uint2 id [[thread_position_in_grid]], uint tix [[thread_index_in_threadgroup]]) {
         if (id.x >= F.get_width() || id.y >= F.get_height()) return;
         float2 m = (float2(id) + 0.5) * P.g;
         float sv[17]; loadS(sv, S, m, kTap, kTap2);
+        uint pix = 2 * (id.y * F.get_width() + id.x);
+        if (kAPhase == 1) {
+            // Before the motion search: the zero vector's cost and both temporal seeds' (inner, whole) costs.
+            float2 tA = 0, tB = 0;
+            if (P.temporal != 0) {
+                tA = sadParts(sv, D, m + float2(ps.read(id).xy), kTap, kTap2);
+                tB = sadParts(sv, D, m - float2(po.read(id).xy), kTap, kTap2);
+            }
+            pre[pix] = float4(sadS(sv, D, m, kTap, kTap2, 1e9, m), tA, tB.x);
+            pre[pix + 1] = float4(tB.y, 0, 0, 0);
+            return;
+        }
         int2 cells = int2(vs.get_width(), vs.get_height());
         int2 c0 = int2(m / P.blk);
         float2 cf = m / P.blk - 0.5;
@@ -1475,7 +2220,8 @@ public final class MotionInterpolator: @unchecked Sendable {
         threadgroup half2 *tried = triedTG + tix * 22;
         int nt = 0;
         float2 best = float2(0);
-        float bc = sadS(sv, D, m, kTap, kTap2, 1e9, m) - 0.004;
+        float4 pr0 = kAPhase == 2 ? pre[pix] : float4(0), pr1 = kAPhase == 2 ? pre[pix + 1] : float4(0);
+        float bc = (kAPhase == 2 ? pr0.x : sadS(sv, D, m, kTap, kTap2, 1e9, m)) - 0.004;
         tried[nt++] = half2(0);
         for (int k = -3; k < 18; k++) {
             float2 d;
@@ -1493,7 +2239,13 @@ public final class MotionInterpolator: @unchecked Sendable {
             if (dup) continue;
             tried[nt++] = half2(d);
             float pen = P.lam * min(distance(d, vloc), 12.0);
-            float cost = sadS(sv, D, m + d, kTap, kTap2, bc - pen, m) + pen;
+            float raw;
+            if (kAPhase == 2 && k < -1) {
+                // The seed's scores from before the search, returned as sadS would with this bound.
+                float2 pp = k == -3 ? pr0.yz : float2(pr0.w, pr1.x);
+                raw = pp.x >= bc - pen ? pp.x : pp.y;
+            } else raw = sadS(sv, D, m + d, kTap, kTap2, bc - pen, m);
+            float cost = raw + pen;
             if (cost < bc) { bc = cost; best = d; }
         }
         F.write(half4(half2(best), half(bc), 0), id);
@@ -1573,12 +2325,15 @@ public final class MotionInterpolator: @unchecked Sendable {
     kernel void mfg_splat(texture2d<half, access::read> F [[texture(0)]], device atomic_uint *sp [[buffer(0)]],
                           constant float4 &P [[buffer(1)]], constant float &G [[buffer(2)]],
                           texture2d<half, access::read> Fo [[texture(1)]], device const float2 *hud [[buffer(3)]],
-                          constant int &hudOn [[buffer(4)]], uint2 id [[thread_position_in_grid]]) {
+                          constant int &hudOn [[buffer(4)]], device const uint *hudAnyP [[buffer(5)]], device atomic_uint *reach [[buffer(8)]],
+                          uint2 id [[thread_position_in_grid]]) {
         uint W = F.get_width(), H = F.get_height();
         if (id.x >= W || id.y >= H) return;
         half4 c = F.read(id);
         if (float(c.z) > P.w) return;
         float2 v = float2(c.xy);
+        // v0.8 (MFG_REACH): the largest vertical component a splatted vector can bring into the selection, 1/16 px.
+        if (kReach) atomic_fetch_max_explicit(reach, uint(ceil(fabs(v.y) * 16.0)), memory_order_relaxed);
         float2 t = ((float2(id) + 0.5) * G + (P.z < 0 ? TA : TB) * v) / G;   // A side (P.z < 0) moves t of its way, B side 1 - t              // target cell
         if (any(t < 0.0) || t.x >= float(W) || t.y >= float(H)) return;
         float2 d = P.z * v;
@@ -1587,8 +2342,43 @@ public final class MotionInterpolator: @unchecked Sendable {
         if (all(o >= 0) && o.x < int(W) && o.y < int(H)) cons = distance(float2(Fo.read(uint2(o)).xy), -v) < 1.0 + 0.05 * length(v);
         uint pr = (cons ? 2048u : 1u) + uint(clamp(distance(d, P.xy) * 16.0, 0.0, 2046.0));
         uint2 q = uint2(t);
-        if (hudOn != 0 && (hud[id.y * W + id.x].y > 0.5 || hud[q.y * W + q.x].y > 0.5)) return;   // static HUD
+        if (hudOn != 0 && (!kHudSkip || hudAnyP[0] != 0) && (hud[id.y * W + id.x].y > 0.5 || hud[q.y * W + q.x].y > 0.5)) return;   // static HUD
         atomic_fetch_max_explicit(&sp[q.y * W + q.x], (pr << 20) | (id.y * W + id.x), memory_order_relaxed);
+    }
+
+    // 4x (MFG_SPLAT3): mfg_splat for t = 0.25, 0.5 and 0.75 in one traversal (same arithmetic per phase, the phase
+    // times as compile-time constants like the per-phase kernels), into sp0 / sp1 / sp2.
+    kernel void mfg_splat3(texture2d<half, access::read> F [[texture(0)]], device atomic_uint *sp0 [[buffer(0)]],
+                           constant float4 &P [[buffer(1)]], constant float &G [[buffer(2)]],
+                           texture2d<half, access::read> Fo [[texture(1)]], device const float2 *hud [[buffer(3)]],
+                           constant int &hudOn [[buffer(4)]], device const uint *hudAnyP [[buffer(5)]],
+                           device atomic_uint *sp1 [[buffer(6)]], device atomic_uint *sp2 [[buffer(7)]], device atomic_uint *reach [[buffer(8)]],
+                           uint2 id [[thread_position_in_grid]]) {
+        uint W = F.get_width(), H = F.get_height();
+        if (id.x >= W || id.y >= H) return;
+        half4 c = F.read(id);
+        if (float(c.z) > P.w) return;
+        float2 v = float2(c.xy);
+        // v0.8 (MFG_REACH): the largest vertical component a splatted vector can bring into the selection, 1/16 px.
+        if (kReach) atomic_fetch_max_explicit(reach, uint(ceil(fabs(v.y) * 16.0)), memory_order_relaxed);
+        float2 d = P.z * v;
+        int2 o = int2(floor(((float2(id) + 0.5) * G + v) / G));
+        bool cons = false;
+        if (all(o >= 0) && o.x < int(W) && o.y < int(H)) cons = distance(float2(Fo.read(uint2(o)).xy), -v) < 1.0 + 0.05 * length(v);
+        uint pr = (cons ? 2048u : 1u) + uint(clamp(distance(d, P.xy) * 16.0, 0.0, 2046.0));
+        bool hudX = hudOn != 0 && (!kHudSkip || hudAnyP[0] != 0);
+        bool srcHud = hudX && hud[id.y * W + id.x].y > 0.5;
+        uint key = (pr << 20) | (id.y * W + id.x);
+        #pragma unroll
+        for (int k = 0; k < 3; k++) {
+            const float ta = k == 0 ? 0.25 : k == 1 ? 0.5 : 0.75, tb = 1.0 - ta;
+            float2 t = ((float2(id) + 0.5) * G + (P.z < 0 ? ta : tb) * v) / G;
+            if (any(t < 0.0) || t.x >= float(W) || t.y >= float(H)) continue;
+            uint2 q = uint2(t);
+            if (srcHud || (hudX && hud[q.y * W + q.x].y > 0.5)) continue;
+            device atomic_uint *sp = k == 0 ? sp0 : k == 1 ? sp1 : sp2;
+            atomic_fetch_max_explicit(&sp[q.y * W + q.x], key, memory_order_relaxed);
+        }
     }
 
     // Grid field (cells G guide px apart) -> per guide pixel: where the 4 surrounding cells disagree, each pixel takes
@@ -1877,20 +2667,24 @@ public final class MotionInterpolator: @unchecked Sendable {
                           texture2d<float, access::read> vb [[texture(2)]], texture2d<uint, access::write> S [[texture(3)]],
                           texture2d<float, access::read> ga [[texture(4)]], texture2d<float, access::read> gb [[texture(5)]],
                           device atomic_uint *bins [[buffer(0)]], constant int2 &band [[buffer(1)]], constant float2 &blk [[buffer(2)]],
-                          uint2 tid [[thread_position_in_grid]]) {
+                          device uchar *flag [[buffer(3)]], uint2 tid [[thread_position_in_grid]]) {
         uint2 id = uint2(tid.x, tid.y + uint(band.x));
         if (id.x >= S.get_width() || int(id.y) >= band.y) return;
-        int2 gh = int2(ga.get_width() - 1, ga.get_height() - 1);
-        float lo = 1, hv = 0;
-        for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
-            uint2 g = uint2(clamp(int2(id) + int2(i, j), int2(0), gh));
-            float r = ga.read(g).r, r2 = gb.read(g).r;
-            lo = min(lo, min(r, r2)); hv = max(hv, max(r, r2));
+        // MFG_PRE: kGPhase 1 runs the tests below that need no motion (before the search) and flags the px that
+        // pass them; kGPhase 2 (after the search) runs only the flagged px, from the strokes on.
+        uint fi = tid.y * S.get_width() + tid.x;
+        if (kGPhase == 2 && flag[fi] == 0) return;
+        if (kGPhase != 2) {
+            int2 gh = int2(ga.get_width() - 1, ga.get_height() - 1);
+            float lo = 1, hv = 0;
+            for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+                uint2 g = uint2(clamp(int2(id) + int2(i, j), int2(0), gh));
+                float r = ga.read(g).r, r2 = gb.read(g).r;
+                lo = min(lo, min(r, r2)); hv = max(hv, max(r, r2));
+            }
+            // Flat, or nothing bright (overlay text is bright over a dark shadow): no glyph here. Most band px stop here.
+            if (hv - lo < kGStroke || hv < kGBright) { S.write(uint4(0), id); if (kGPhase == 1) flag[fi] = 0; return; }
         }
-        // Flat, or nothing bright (overlay text is bright over a dark shadow): no glyph here. Most band px stop here.
-        if (hv - lo < kGStroke || hv < kGBright) { S.write(uint4(0), id); return; }
-        int2 cells = int2(vb.get_width(), vb.get_height());
-        int2 c0 = int2((float2(id) + 0.5) / blk);
         // Strokes first (most band px have none), then the world motion only where needed.
         float sA[4], sB[4]; bool anyS = false;
         for (uint q = 0; q < 4; q++) {
@@ -1898,7 +2692,10 @@ public final class MotionInterpolator: @unchecked Sendable {
             sA[q] = strokeS(ya, p); sB[q] = strokeS(yb, p);
             anyS = anyS || max(fabs(sA[q]), fabs(sB[q])) >= kGStroke;
         }
-        if (!anyS) { S.write(uint4(0), id); return; }
+        if (!anyS) { S.write(uint4(0), id); if (kGPhase == 1) flag[fi] = 0; return; }
+        if (kGPhase == 1) { flag[fi] = 1; return; }
+        int2 cells = int2(vb.get_width(), vb.get_height());
+        int2 c0 = int2((float2(id) + 0.5) / blk);
         // World motion: the vector that best explains the 4×4 luma patch (B(p) ≈ A(p + dw)) among the 3×3 VideoToolbox
         // blocks around, refined by ±0.5 px. A vector that merely exists nearby is not enough: grain and texture then
         // look "unexplained" and seed everywhere.
@@ -1977,11 +2774,16 @@ public final class MotionInterpolator: @unchecked Sendable {
     // Indirect grids for the rows [split, H) of the fused warp: the glyph kernel runs only on the threadgroup rows
     // within kGReach guide px of a glyph row of this pair, the plain copy on the rest (above and below). args:
     // three grids (glyph, plain above, plain below) then their first rows. p = (tg cols, tg height, split, H).
-    kernel void mfg_gargs(device const uint *anyG [[buffer(0)]], device uint *args [[buffer(1)]], constant uint4 &p [[buffer(2)]]) {
+    // v0.8 (kReach, MFG_REACH): the reach is measured instead of the fixed 48 guide px: the largest vertical vector
+    // component the warp can use (anchored fields as splatted, anyG[3], and the VideoToolbox fields, rr.x; 1/16 px)
+    // times the largest phase share (rr.y / 16), plus 2 px for the bilinear footprint; p.z is then 0 (whole frame).
+    kernel void mfg_gargs(device const uint *anyG [[buffer(0)]], device uint *args [[buffer(1)]], constant uint4 &p [[buffer(2)]],
+                          constant uint2 &rr [[buffer(3)]]) {
         uint th = p.y, nAll = (p.w - p.z + th - 1) / th;
         uint g0 = nAll, g1 = nAll;                                 // glyph threadgroup rows [g0, g1)
+        uint R = kReach ? (max(anyG[3], rr.x) * rr.y + 255) / 256 + 2 : 48;
         if (anyG[0] != 0) {
-            uint y0 = anyG[1] > p.z + 48 ? anyG[1] - 48 : p.z, y1 = anyG[2] + 49;
+            uint y0 = anyG[1] > p.z + R ? anyG[1] - R : p.z, y1 = anyG[2] + R + 1;
             g0 = min(nAll, (y0 - p.z) / th); g1 = min(nAll, (y1 - p.z + th - 1) / th);
         }
         if (g1 <= g0) { g0 = nAll; g1 = nAll; }
